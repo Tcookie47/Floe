@@ -263,7 +263,7 @@ removes it on Save.
 | Tenant ID | `adls_tenant_id` | shown when Auth mode = service_principal | — | Azure AD tenant ID. | `<tenant-id>` |
 | Client ID | `adls_client_id` | shown when Auth mode = service_principal | — | Service principal client ID. | |
 | Client secret | `adls_client_secret` (secret) | shown when Auth mode = service_principal | — | Service principal secret. Write-only. | |
-| CA cert file | `adls_ca_cert_file` | remote mode | system bundle (or certifi's, if no system bundle is found) | CA bundle path for the azure/curl transport. | `/path/to/ca-bundle.pem` |
+| CA cert file | `adls_ca_cert_file` | remote mode | macOS/Linux: system bundle (or certifi's, if no system bundle is found); Windows: the Windows certificate store | CA bundle (PEM) for the azure/curl transport. Setting it forces the curl transport with this bundle on every OS. | `/path/to/ca-bundle.pem` |
 
 ### Nessie — hidden in local mode
 
@@ -360,8 +360,9 @@ contains at least one container subdirectory.
 4. **ADLS read** — builds a throwaway DuckDB connection with your storage
    credential and reads the `metadata.json` of the first table found on the
    main ref, as plain text. A failure usually means the **storage
-   account key/client secret is wrong**, or the **CA cert file** doesn't
-   match what the server presents.
+   account key/client secret is wrong**, or — if the message says the HTTPS
+   certificate couldn't be verified — see *HTTPS certificate errors* in
+   Troubleshooting.
 
 Each step shows a pass/fail line with its message and elapsed time.
 
@@ -560,6 +561,22 @@ queries an Iceberg table, DuckDB downloads its `azure`/`iceberg`/`httpfs`
 extensions from `extensions.duckdb.org`. This needs network access once;
 after that they're cached locally. If the download fails, the error names
 the extension and suggests checking your network connection.
+
+**HTTPS certificate errors ("Couldn't verify the HTTPS certificate for the
+storage account …").** The storage account's TLS certificate didn't chain to
+a root Floe trusts. This is common on company laptops whose network inspects
+HTTPS with a corporate root CA. Fix: export your company's root CA bundle as
+PEM and set **Storage → CA cert file** in the profile (or `ADLS_CA_CERT_FILE`),
+then re-run **Test connection** — or try another network.
+
+- *Windows:* with no CA cert file set, Floe uses the azure extension's default
+  transport (WinHTTP), which trusts the Windows certificate store, including
+  corporate roots your IT department installed. Setting a CA cert file
+  switches to the curl transport with only that bundle, so it must contain
+  every root you need.
+- *macOS/Linux:* Floe uses curl with `/etc/ssl/cert.pem` (or certifi's
+  bundle). Corporate roots in the macOS Keychain are **not** read, so set the
+  CA cert file on an inspected network.
 
 **"Access denied" reading a file.** This usually means `restrict_file_access`
 correctly blocked a read outside the current branch's expected container(s).

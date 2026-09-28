@@ -123,3 +123,71 @@ def test_malformed_uri_fails_tcp_step_cleanly(fake_nessie, nessie_uri):
     results = list(run_connection_test(profile, {}))
     assert len(results) == 1
     assert not results[0].ok
+
+
+class _FakeConn:
+    def __init__(self, fail_with: Exception) -> None:
+        self.sqls: list[str] = []
+        self._fail_with = fail_with
+
+    def execute(self, sql, params=None):
+        self.sqls.append(sql)
+        if "read_text" in sql:
+            raise self._fail_with
+
+    def close(self) -> None:
+        pass
+
+
+def _run_default_probe(monkeypatch, profile, error):
+    import duckdb
+
+    from floe.core import connection_test, context, extensions
+
+    conn = _FakeConn(error)
+    monkeypatch.setattr(connection_test.duckdb, "connect", lambda *a, **k: conn)
+    monkeypatch.setattr(extensions, "bundled_extension_dir", lambda: None)
+    monkeypatch.setattr(context.sys, "platform", "win32")
+    monkeypatch.setenv("CURL_CA_INFO", "placeholder")  # so teardown restores the original
+    monkeypatch.delenv("CURL_CA_INFO")
+    monkeypatch.setattr(context, "_ORIGINAL_CURL_CA_INFO", None)
+    assert isinstance(error, duckdb.Error)
+    with pytest.raises(Exception) as info:
+        connection_test._default_duckdb_probe(
+            profile, {"adls_account_key": "k"}, "abfss://c@a.dfs.core.windows.net/x.json"
+        )
+    return conn, info.value
+
+
+def test_default_probe_on_windows_maps_tls_errors(monkeypatch):
+    import duckdb
+
+    from floe.core.errors import AdlsTlsError
+
+    profile = Profile(name="p", adls_account="eg-acct")
+    conn, err = _run_default_probe(
+        monkeypatch,
+        profile,
+        duckdb.IOException("Fail to get a new connection. SSL peer certificate or SSH remote "
+                           "key was not OK"),
+    )
+    assert isinstance(err, AdlsTlsError) and "eg-acct" in err.user_message()
+    assert not any("azure_transport_option_type" in s for s in conn.sqls)
+    assert not any("ca_cert_file" in s for s in conn.sqls)
+    import os
+
+    assert "CURL_CA_INFO" not in os.environ
+
+
+def test_default_probe_on_windows_with_explicit_ca_uses_curl(monkeypatch):
+    import duckdb
+
+    from floe.core.errors import AdlsAuthError
+
+    profile = Profile(name="p", adls_account="eg-acct", adls_ca_cert_file="C:/ca.pem")
+    conn, err = _run_default_probe(
+        monkeypatch, profile, duckdb.IOException("AuthenticationFailed")
+    )
+    assert isinstance(err, AdlsAuthError)
+    assert "SET azure_transport_option_type = 'curl'" in conn.sqls
+    assert "SET ca_cert_file = 'C:/ca.pem'" in conn.sqls

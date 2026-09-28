@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -51,6 +52,7 @@ import pandas as pd
 from floe.core import diagnostics
 from floe.core.errors import (
     AdlsAuthError,
+    AdlsTlsError,
     CorruptPointer,
     DisallowedFunction,
     ExtensionUnavailable,
@@ -341,6 +343,37 @@ def is_missing_metadata_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _MISSING_FILE_MARKERS)
 
 
+_TLS_MARKERS = (
+    "ssl peer certificate",
+    "certificate verify failed",
+    "ssl certificate problem",
+    "unable to get local issuer certificate",
+    "self signed certificate in certificate chain",
+    "self-signed certificate in certificate chain",
+)
+
+
+def is_storage_tls_error(exc: BaseException) -> bool:
+    """True if `exc` is a DuckDB error caused by HTTPS certificate verification failing.
+
+    Checked before `is_storage_auth_error`: the azure extension wraps TLS failures in a
+    message that says "this could mean the credentials used were wrong".
+    """
+    if not isinstance(exc, duckdb.Error):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TLS_MARKERS)
+
+
+def storage_error(exc: BaseException, profile: Profile) -> FloeError | None:
+    """Map a remote storage failure to `AdlsTlsError` / `AdlsAuthError`, else None."""
+    if is_storage_tls_error(exc):
+        return AdlsTlsError(profile.adls_account)
+    if is_storage_auth_error(exc):
+        return AdlsAuthError(profile.adls_account, profile.adls_auth)
+    return None
+
+
 def is_storage_auth_error(exc: BaseException) -> bool:
     if not isinstance(exc, duckdb.Error):
         return False
@@ -351,10 +384,26 @@ def is_storage_auth_error(exc: BaseException) -> bool:
 # --------------------------------------------------------------------------- remote setup
 
 
+def uses_curl_transport(profile: Profile) -> bool:
+    """Whether DuckDB's azure extension is forced onto the curl transport.
+
+    An explicit profile CA bundle always means curl + that bundle. Otherwise Windows keeps
+    the extension's default transport (WinHTTP), which trusts the Windows certificate
+    store -- including corporate TLS-inspection roots -- whereas curl there has no trust
+    store at all. macOS/Linux use curl with a PEM bundle (see `resolve_ca_bundle`).
+    """
+    return bool(profile.adls_ca_cert_file) or sys.platform != "win32"
+
+
 def resolve_ca_bundle(profile: Profile) -> str | None:
-    """Profile value, else /etc/ssl/cert.pem if it exists, else certifi's bundle."""
+    """CA bundle for the curl transport, or None when curl isn't used / nothing is found.
+
+    Profile value, else (not on Windows) /etc/ssl/cert.pem if it exists, else certifi's.
+    """
     if profile.adls_ca_cert_file:
         return profile.adls_ca_cert_file
+    if not uses_curl_transport(profile):
+        return None
     if os.path.exists(DEFAULT_CA_BUNDLE):
         return DEFAULT_CA_BUNDLE
     try:
@@ -427,9 +476,12 @@ def build_remote_setup(
     if not storage:
         return stmts
 
-    plain("SET azure_transport_option_type = 'curl'")
-    if ca_bundle:
-        plain(f"SET ca_cert_file = {quote_literal(ca_bundle)}")
+    # Windows without an explicit CA bundle: leave the transport at the extension's
+    # default ('default' = WinHTTP), which uses the Windows certificate store.
+    if uses_curl_transport(profile):
+        plain("SET azure_transport_option_type = 'curl'")
+        if ca_bundle:
+            plain(f"SET ca_cert_file = {quote_literal(ca_bundle)}")
 
     account = profile.adls_account
     if profile.adls_auth == "service_principal":
@@ -1443,8 +1495,10 @@ class FloeSession:
                 "Access denied: Floe only reads files in this branch's container and the "
                 f"shared containers. ({message})"
             )
-        if not self.is_local and is_storage_auth_error(exc):
-            return AdlsAuthError(self._profile.adls_account, self._profile.adls_auth)
+        if not self.is_local:
+            mapped = storage_error(exc, self._profile)
+            if mapped is not None:
+                return mapped
         return QueryError(message)
 
     def _execute_df(self, ctx: Context, sql: str, token: CancelToken) -> pd.DataFrame:
@@ -1632,8 +1686,10 @@ class FloeSession:
                 raise _MetadataGone(
                     f"The metadata of {info.dotted} no longer exists (catalog changed)."
                 ) from None
-            if not self.is_local and is_storage_auth_error(exc):
-                raise AdlsAuthError(self._profile.adls_account, self._profile.adls_auth) from None
+            if not self.is_local:
+                mapped = storage_error(exc, self._profile)
+                if mapped is not None:
+                    raise mapped from None
             raise MetadataReadError(info.dotted, type(exc).__name__) from None
         finally:
             try:

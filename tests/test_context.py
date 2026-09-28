@@ -31,6 +31,7 @@ from floe.core.context import (
 )
 from floe.core.errors import (
     AdlsAuthError,
+    AdlsTlsError,
     CorruptPointer,
     DisallowedFunction,
     MissingDataSourceColumn,
@@ -713,7 +714,9 @@ def _profile(**kw) -> Profile:
     return Profile(**values)
 
 
-def test_remote_setup_sql_account_key():
+def test_remote_setup_sql_account_key(monkeypatch):
+    # macOS/Linux behaviour (curl + CA bundle); Windows is covered separately.
+    monkeypatch.setattr(context_mod.sys, "platform", "linux")
     stmts = build_remote_setup(_profile(), {"adls_account_key": ACCOUNT_KEY}, "/ca/bundle.pem")
     sqls = [s.sql for s in stmts]
     assert sqls[:6] == [
@@ -764,6 +767,8 @@ def test_remote_setup_sql_without_secret_or_storage():
 
 
 def test_resolve_ca_bundle(monkeypatch):
+    # macOS/Linux resolution order; Windows is covered separately.
+    monkeypatch.setattr(context_mod.sys, "platform", "linux")
     assert resolve_ca_bundle(_profile(adls_ca_cert_file="/my/ca.pem")) == "/my/ca.pem"
     monkeypatch.setattr(context_mod.os.path, "exists", lambda p: p == "/etc/ssl/cert.pem")
     assert resolve_ca_bundle(_profile()) == "/etc/ssl/cert.pem"
@@ -775,6 +780,92 @@ def test_resolve_ca_bundle(monkeypatch):
         assert result is None
     else:
         assert result == certifi.where()
+
+
+_TLS_MESSAGE = (
+    "IO Error: AzureStorageFileSystem could not open file: "
+    "'abfss://ctr@acct.dfs.core.windows.net/t/metadata/v1.metadata.json', unknown error "
+    "occurred, this could mean the credentials used were wrong. Original error message: "
+    "'Fail to get a new connection for: https://acct.blob.core.windows.net. SSL peer "
+    "certificate or SSH remote key was not OK'"
+)
+
+
+def test_tls_errors_map_to_adls_tls_error_not_auth(session):
+    exc = duckdb.IOException(_TLS_MESSAGE)
+    assert context_mod.is_storage_tls_error(exc)
+    mapped = session._map_duckdb_error(exc)
+    assert isinstance(mapped, AdlsTlsError)
+    assert mapped.account == "acct"
+    text = mapped.user_message()
+    assert "acct" in text and "CA cert file" in text and "credentials" not in text
+    for msg in (
+        "SSL certificate problem: unable to get local issuer certificate",
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+    ):
+        assert context_mod.is_storage_tls_error(duckdb.IOException(msg))
+    # Real auth failures keep their own error.
+    auth = duckdb.IOException("AuthenticationFailed: Server failed to authenticate the request")
+    assert not context_mod.is_storage_tls_error(auth)
+    assert isinstance(session._map_duckdb_error(auth), AdlsAuthError)
+
+
+def test_certifi_is_importable():
+    import certifi
+
+    assert os.path.exists(certifi.where())
+
+
+def _storage_sql(profile: Profile) -> list[str]:
+    bundle = resolve_ca_bundle(profile)
+    return [s.sql for s in build_remote_setup(profile, {"adls_account_key": ACCOUNT_KEY}, bundle)]
+
+
+def test_remote_setup_sql_on_windows_keeps_default_transport(monkeypatch):
+    """Windows: curl has no trust store there, WinHTTP uses the Windows cert store."""
+    monkeypatch.setattr(context_mod.sys, "platform", "win32")
+    monkeypatch.setattr(context_mod.os.path, "exists", lambda p: True)
+    assert resolve_ca_bundle(_profile()) is None
+    sqls = _storage_sql(_profile())
+    assert not any("azure_transport_option_type" in s for s in sqls)
+    assert not any("ca_cert_file" in s for s in sqls)
+    assert any("CREATE OR REPLACE SECRET adls" in s for s in sqls)
+
+
+def test_remote_setup_sql_on_windows_with_explicit_ca_uses_curl(monkeypatch):
+    monkeypatch.setattr(context_mod.sys, "platform", "win32")
+    sqls = _storage_sql(_profile(adls_ca_cert_file="C:/certs/corp-root.pem"))
+    assert "SET azure_transport_option_type = 'curl'" in sqls
+    assert "SET ca_cert_file = 'C:/certs/corp-root.pem'" in sqls
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_remote_setup_sql_on_posix_uses_curl_and_a_bundle(monkeypatch, platform):
+    monkeypatch.setattr(context_mod.sys, "platform", platform)
+    monkeypatch.setattr(context_mod.os.path, "exists", lambda p: p == "/etc/ssl/cert.pem")
+    sqls = _storage_sql(_profile())
+    assert "SET azure_transport_option_type = 'curl'" in sqls
+    assert "SET ca_cert_file = '/etc/ssl/cert.pem'" in sqls
+    import certifi
+
+    monkeypatch.setattr(context_mod.os.path, "exists", lambda p: False)
+    sqls = _storage_sql(_profile())
+    assert "SET azure_transport_option_type = 'curl'" in sqls
+    assert f"SET ca_cert_file = {quote_literal(certifi.where())}" in sqls
+    sqls = _storage_sql(_profile(adls_ca_cert_file="/my/ca.pem"))
+    assert "SET ca_cert_file = '/my/ca.pem'" in sqls
+
+
+def test_windows_leaves_curl_ca_info_alone(monkeypatch):
+    monkeypatch.setattr(context_mod.sys, "platform", "win32")
+    monkeypatch.delenv("CURL_CA_INFO", raising=False)
+    monkeypatch.setattr(context_mod, "_ORIGINAL_CURL_CA_INFO", None)
+    context_mod.apply_curl_ca_bundle(resolve_ca_bundle(_profile()))
+    assert "CURL_CA_INFO" not in os.environ
+    context_mod.apply_curl_ca_bundle(resolve_ca_bundle(_profile(adls_ca_cert_file="C:/ca.pem")))
+    assert os.environ["CURL_CA_INFO"] == "C:/ca.pem"
+    context_mod.apply_curl_ca_bundle(None)
+    assert "CURL_CA_INFO" not in os.environ
 
 
 def test_connection_setup_and_logs_never_contain_secrets(make_session, caplog):

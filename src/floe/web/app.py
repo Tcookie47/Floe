@@ -27,6 +27,7 @@ from floe import __version__
 from floe.core import diagnostics
 from floe.core.errors import (
     AdlsAuthError,
+    AdlsTlsError,
     FloeError,
     KeychainError,
     NessieAuthError,
@@ -57,7 +58,7 @@ def _error_response(status: int, payload: dict[str, Any]) -> JSONResponse:
 def _floe_status(exc: FloeError) -> int:
     if isinstance(exc, ProfileNotFound):
         return 404
-    if isinstance(exc, NessieUnreachable | NessieAuthError | AdlsAuthError):
+    if isinstance(exc, NessieUnreachable | NessieAuthError | AdlsAuthError | AdlsTlsError):
         return 502
     if isinstance(exc, KeychainError):
         return 503

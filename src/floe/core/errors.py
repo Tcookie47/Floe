@@ -122,6 +122,22 @@ class AdlsAuthError(FloeError):
         return f"Storage authentication failed for account {self.account} (mode: {self.auth_mode})"
 
 
+class AdlsTlsError(FloeError):
+    """The HTTPS certificate presented for the storage account could not be verified."""
+
+    def __init__(self, account: str) -> None:
+        self.account = account
+        super().__init__(f"TLS certificate verification failed for storage account {account}")
+
+    def user_message(self) -> str:
+        return (
+            "Couldn't verify the HTTPS certificate for the storage account "
+            f"{self.account}. If your network inspects HTTPS (common on company laptops), "
+            "set Storage → CA cert file to your company's root CA bundle (PEM), "
+            "or try another network."
+        )
+
+
 class QueryCancelled(FloeError):
     """The user cancelled a running query."""
 

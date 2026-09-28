@@ -86,6 +86,7 @@ def _default_duckdb_probe(
         build_remote_setup,
         quote_literal,
         resolve_ca_bundle,
+        storage_error,
     )
     from floe.core.extensions import bundled_extension_dir
 
@@ -99,10 +100,16 @@ def _default_duckdb_probe(
             conn.execute(f"SET extension_directory = {quote_literal(str(ext_dir))}")
         for stmt in build_remote_setup(profile, secrets, ca_bundle, storage=True):
             conn.execute(stmt.sql)
-        conn.execute(
-            "SELECT count(*) FROM read_text(?)",
-            [metadata_location],
-        )
+        try:
+            conn.execute(
+                "SELECT count(*) FROM read_text(?)",
+                [metadata_location],
+            )
+        except duckdb.Error as exc:
+            mapped = storage_error(exc, profile)
+            if mapped is not None:
+                raise mapped from None
+            raise
     finally:
         conn.close()
 

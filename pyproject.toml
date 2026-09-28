@@ -19,6 +19,8 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "jinja2",
+    # CA bundle for DuckDB's curl transport / urllib when the OS store isn't usable.
+    "certifi",
 ]
 
 [project.optional-dependencies]

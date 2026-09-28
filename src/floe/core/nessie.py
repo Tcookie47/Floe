@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -269,6 +270,10 @@ def default_ssl_context() -> ssl.SSLContext:
     default context trusts nothing and every HTTPS request (e.g. the Azure AD token
     endpoint) fails certificate verification. If the default store is empty, fall back to
     the system bundle, then to certifi's. `SSL_CERT_FILE` / `SSL_CERT_DIR` still apply.
+
+    On Windows `create_default_context()` loads the Windows certificate store (via
+    `load_default_certs`), which also holds any corporate TLS-inspection roots; the
+    fallback only *adds* certifi when that store came back empty and never skips it.
     """
     global _ssl_context
     with _ssl_context_lock:
@@ -276,7 +281,7 @@ def default_ssl_context() -> ssl.SSLContext:
             ctx = ssl.create_default_context()
             if ctx.cert_store_stats().get("x509_ca", 0) == 0:
                 fallback: str | None = None
-                if os.path.exists(SYSTEM_CA_BUNDLE):
+                if sys.platform != "win32" and os.path.exists(SYSTEM_CA_BUNDLE):
                     fallback = SYSTEM_CA_BUNDLE
                 else:
                     try:

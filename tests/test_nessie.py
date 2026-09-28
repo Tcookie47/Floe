@@ -459,3 +459,31 @@ def test_default_ssl_context_falls_back_when_default_store_is_empty(monkeypatch)
     assert ctx.cert_store_stats()["x509_ca"] > 0
     assert nessie.default_ssl_context() is ctx
     monkeypatch.setattr(nessie, "_ssl_context", None)
+
+
+def test_default_ssl_context_keeps_the_windows_store(monkeypatch):
+    """win32: the default context (Windows store) is used as is when it has roots."""
+    import ssl
+
+    import certifi
+
+    from floe.core import nessie
+
+    base = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    base.load_verify_locations(cafile=certifi.where())  # stands in for the Windows store
+    loaded: list[object] = []
+    monkeypatch.setattr(nessie, "_ssl_context", None)
+    monkeypatch.setattr(nessie.sys, "platform", "win32")
+    monkeypatch.setattr(nessie.ssl, "create_default_context", lambda: base)
+    monkeypatch.setattr(base, "load_verify_locations", lambda **kw: loaded.append(kw))
+    assert nessie.default_ssl_context() is base
+    assert loaded == []  # nothing added or replaced
+
+    # Empty Windows store: certifi is added, never the POSIX system bundle path.
+    empty = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    monkeypatch.setattr(nessie, "_ssl_context", None)
+    monkeypatch.setattr(nessie.ssl, "create_default_context", lambda: empty)
+    monkeypatch.setattr(nessie.os.path, "exists", lambda p: True)
+    ctx = nessie.default_ssl_context()
+    assert ctx is empty and ctx.cert_store_stats()["x509_ca"] > 0
+    monkeypatch.setattr(nessie, "_ssl_context", None)
