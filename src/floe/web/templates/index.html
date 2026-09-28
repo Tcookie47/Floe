@@ -50,6 +50,7 @@
       <button type="button" role="tab" class="tab" data-tab="preview" id="tabbtn-preview" title="Alt+1">Preview</button>
       <button type="button" role="tab" class="tab" data-tab="schema" id="tabbtn-schema" title="Alt+2">Schema</button>
       <button type="button" role="tab" class="tab" data-tab="sql" id="tabbtn-sql" title="Alt+3">SQL</button>
+      <button type="button" role="tab" class="tab" data-tab="timeline" id="tabbtn-timeline" title="Alt+4">Timeline</button>
     </nav>
 
     <section id="tab-preview" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-preview">
@@ -99,11 +100,40 @@
             <button type="button" id="btn-ask-cancel" disabled>Cancel</button>
           </div>
           <div id="ask-status" class="ask-status" aria-live="polite"></div>
+          <p id="ask-generated-by" class="note ask-generated-by" hidden></p>
           <ul id="ask-warnings" class="warnings" hidden></ul>
           <pre id="ask-preview" class="ask-preview" hidden></pre>
         </aside>
       </div>
       <div id="sql-results" class="results-host"></div>
+    </section>
+
+    <section id="tab-timeline" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-timeline" hidden>
+      <div id="tl-message" class="results-message" hidden></div>
+      <div id="tl-layout" class="tl-layout">
+        <div class="tl-pane tl-fresh" role="region" aria-label="Freshness">
+          <div class="tl-bar">
+            <strong>Freshness</strong>
+            <input type="search" id="tl-filter" placeholder="Filter tables…" aria-label="Filter freshness by table" autocomplete="off">
+            <select id="tl-layer" aria-label="Layer"><option value="">All layers</option></select>
+            <span id="tl-fresh-status" class="muted"></span>
+            <span class="spacer"></span>
+            <span class="note">Metadata only — no rows are read.</span>
+            <button type="button" id="tl-reload" title="Re-read the timeline for this branch">Reload</button>
+          </div>
+          <div id="tl-fresh-body" class="tl-scroll"></div>
+        </div>
+        <div class="tl-lower">
+          <div class="tl-pane tl-commits" role="region" aria-label="Branch timeline">
+            <div class="tl-bar"><strong>Branch timeline</strong><span id="tl-commits-status" class="muted"></span></div>
+            <div id="tl-commits-body" class="tl-scroll"></div>
+          </div>
+          <div class="tl-pane tl-table" role="region" aria-label="Table history">
+            <div class="tl-bar"><strong>Table history</strong><span id="tl-table-title" class="muted"></span></div>
+            <div id="tl-table-body" class="tl-scroll"></div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 </div>
@@ -159,20 +189,29 @@
     <div id="as-error" class="error-box span2" hidden></div>
     <label for="as-enabled">Enabled</label>
     <span><input type="checkbox" id="as-enabled"></span>
-    <label for="as-model">Model ID</label>
-    <span>
-      <input type="text" id="as-model" placeholder="vendor/model-name:free" spellcheck="false">
-      <small class="hint">Any OpenRouter model ID. Free models (IDs ending in <code>:free</code>) are listed on openrouter.ai/models; see the README for suggestions.</small>
-    </span>
-    <label for="as-base-url">Base URL</label>
-    <span><input type="url" id="as-base-url" spellcheck="false"></span>
-    <label for="as-timeout">Timeout (s)</label>
-    <span><input type="number" id="as-timeout" min="1" max="600" step="1"></span>
     <label for="as-api-key">API key</label>
     <span class="secret-row">
       <input type="password" id="as-api-key" autocomplete="new-password">
       <button type="button" id="as-api-key-clear">Clear</button>
       <small class="hint" id="as-api-key-hint"></small>
+    </span>
+    <span class="span2">
+      <small class="hint">Ask always tries a fixed, ordered list of free models and
+      falls back to the next one if one is busy or unavailable — there's no model to
+      pick.</small>
+    </span>
+    <span class="span2">
+      <details id="as-advanced">
+        <summary>Advanced</summary>
+        <div class="form-grid">
+          <label for="as-base-url">Base URL</label>
+          <span><input type="url" id="as-base-url" spellcheck="false"></span>
+          <label for="as-timeout">Timeout (s)</label>
+          <span><input type="number" id="as-timeout" min="1" max="600" step="1">
+            <small class="hint">Overall time budget for a question, across every model tried.</small>
+          </span>
+        </div>
+      </details>
     </span>
   </form>
   <div class="dialog-foot">
@@ -221,10 +260,11 @@
       <tr><td><kbd>Esc</kbd></td><td>Cancel the running query</td></tr>
       <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>R</kbd></td><td>Refresh the catalog</td></tr>
       <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>F</kbd></td><td>Filter tables (outside the editor)</td></tr>
-      <tr><td><kbd>Alt</kbd>+<kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd></td><td>Preview / Schema / SQL tab</td></tr>
+      <tr><td><kbd>Alt</kbd>+<kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> / <kbd>4</kbd></td><td>Preview / Schema / SQL / Timeline tab</td></tr>
       <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>C</kbd></td><td>Copy selected cells as TSV (in a grid)</td></tr>
       <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>A</kbd></td><td>Select all cells on the page (in a grid)</td></tr>
       <tr><td>Double-click a table</td><td>Insert its view name into the SQL editor</td></tr>
+      <tr><td>Right-click a table (or <kbd>Shift</kbd>+<kbd>F10</kbd>)</td><td>Table menu: Show history</td></tr>
     </table>
   </div>
   <div class="dialog-foot"><span class="spacer"></span><button type="button" data-close>Close</button></div>

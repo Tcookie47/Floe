@@ -37,10 +37,14 @@ Then run:
 floe serve
 ```
 
+or `floe serve --background` to keep Floe running after you close the terminal;
+`floe show` then prints a fresh one-time link (`floe show --open` opens it) and
+`floe stop` stops it.
+
 **What happens:** Floe binds a server to `127.0.0.1` only (never reachable
 from other machines), prints a one-time tokenized URL, and opens it in your
-default browser. Keep the terminal window open while you use Floe — closing
-it (or `Ctrl+C`) stops the server. If the browser doesn't open, copy the
+default browser. With plain `floe serve`, keep the terminal window open while
+you use Floe — closing it (or `Ctrl+C`) stops the server. If the browser doesn't open, copy the
 printed URL manually.
 
 **Where your data lives:**

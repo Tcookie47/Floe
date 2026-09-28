@@ -2,6 +2,8 @@
 // gold first and other layers alphabetically; shared tables under "Reference (main)".
 // The filter matches table names and SQL view names (case-insensitive) and keeps the
 // parents of matches. Status icons carry the table's error message as a tooltip.
+// Right-click (or Shift+F10 / the context-menu key) on a table opens a small menu of
+// `menuItems` ({label, action(table)}), anchored under the row (no inline positioning).
 
 import { clear, h } from "./dom.js";
 
@@ -43,12 +45,14 @@ export function tableTooltip(table) {
 }
 
 export class TableTree {
-  constructor(treeEl, messageEl, filterEl, { onSelect, onActivate }) {
+  constructor(treeEl, messageEl, filterEl, { onSelect, onActivate, menuItems = [] }) {
     this.el = treeEl;
     this.messageEl = messageEl;
     this.filterEl = filterEl;
     this.onSelect = onSelect;
     this.onActivate = onActivate;
+    this.menuItems = menuItems;
+    this.menuEl = null;
     this.rows = new Map(); // dotted key → {table, rowEl}
     this.collapsed = new Set(); // group paths the user collapsed
     this.selectedKey = null;
@@ -63,10 +67,14 @@ export class TableTree {
     treeEl.addEventListener("click", (e) => this.onClick(e));
     treeEl.addEventListener("dblclick", (e) => this.onDblClick(e));
     treeEl.addEventListener("keydown", (e) => this.onKey(e));
+    treeEl.addEventListener("contextmenu", (e) => this.onContextMenu(e));
+    document.addEventListener("click", (e) => { if (this.menuEl && !this.menuEl.contains(e.target)) this.closeMenu(); });
+    treeEl.addEventListener("scroll", () => this.closeMenu());
     this.showMessage("No profile selected.");
   }
 
   showMessage(text, { error = false } = {}) {
+    this.closeMenu();
     clear(this.el);
     this.rows.clear();
     this.el.hidden = true;
@@ -237,10 +245,49 @@ export class TableTree {
   }
 
   onClick(e) {
+    if (this.menuEl && this.menuEl.contains(e.target)) return;
     const row = e.target.closest(".tree-row");
     if (!row) return;
     if (row.classList.contains("group")) { this.toggleGroup(row); this.setCursor(row); return; }
     if (row.dataset.key !== this.selectedKey) this.select(row.dataset.key);
+  }
+
+  // ----- context menu ------------------------------------------------------------------
+  onContextMenu(e) {
+    const row = e.target.closest(".tree-row.table");
+    if (!row || !this.menuItems.length) return;
+    e.preventDefault();
+    this.openMenu(row);
+  }
+
+  openMenu(row) {
+    this.closeMenu();
+    const table = this.rows.get(row.dataset.key).table;
+    this.setCursor(row);
+    const menu = h("div", { class: "menu-popup tree-menu", role: "menu", "aria-label": `${table.view_name} menu` },
+      this.menuItems.map((item) => h("button", {
+        type: "button", role: "menuitem", text: item.label,
+        on: { click: (ev) => { ev.stopPropagation(); this.closeMenu(); item.action(table); } },
+      })));
+    menu.addEventListener("keydown", (ev) => {
+      const buttons = Array.from(menu.querySelectorAll("button"));
+      const i = buttons.indexOf(document.activeElement);
+      if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); this.closeMenu(); this.el.focus(); }
+      else if (ev.key === "ArrowDown") { ev.preventDefault(); buttons[(i + 1) % buttons.length].focus(); }
+      else if (ev.key === "ArrowUp") { ev.preventDefault(); buttons[(i - 1 + buttons.length) % buttons.length].focus(); }
+    });
+    row.classList.add("menu-open");
+    row.append(menu);
+    this.menuEl = menu;
+    menu.querySelector("button").focus();
+  }
+
+  closeMenu() {
+    if (!this.menuEl) return;
+    const row = this.menuEl.parentElement;
+    if (row) row.classList.remove("menu-open");
+    this.menuEl.remove();
+    this.menuEl = null;
   }
 
   onDblClick(e) {
@@ -258,6 +305,11 @@ export class TableTree {
 
   onKey(e) {
     const row = this.cursorEl;
+    if (this.menuEl && this.menuEl.contains(e.target)) return;
+    if ((e.key === "F10" && e.shiftKey) || e.key === "ContextMenu") {
+      if (row && row.classList.contains("table") && this.menuItems.length) { e.preventDefault(); this.openMenu(row); }
+      return;
+    }
     switch (e.key) {
       case "ArrowDown": e.preventDefault(); this.moveCursor(1); break;
       case "ArrowUp": e.preventDefault(); this.moveCursor(-1); break;

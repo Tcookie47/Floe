@@ -20,11 +20,11 @@ import pytest
 
 from floe.core import ask, diagnostics
 from floe.core.ask import (
+    MODEL_CHAIN,
     AskAuthError,
     AskError,
     AskNotConfigured,
     AskQuotaError,
-    AskRateLimited,
     AskResult,
     AskSettings,
     AskUnavailable,
@@ -34,6 +34,7 @@ from floe.core.ask import (
     build_prompt,
     extract_sql,
     get_api_key,
+    get_model_chain,
     has_api_key,
     load_settings,
     pick_focus_views,
@@ -56,7 +57,7 @@ SENTINEL_NUMBERS = ["987654321987", "123456.789125"]
 
 
 def _settings(**kw) -> AskSettings:
-    values = dict(enabled=True, model="synthetic/model-a", base_url="http://fake.invalid/api/v1")
+    values = dict(enabled=True, base_url="http://fake.invalid/api/v1")
     values.update(kw)
     return AskSettings(**values)
 
@@ -74,13 +75,32 @@ class _Resp(io.BytesIO):
 
 
 class FakeOpener:
-    """Records requests; returns a canned response or raises a canned exception."""
+    """Records chat-completions requests; returns a canned response or raises a canned
+    exception. `GET .../models` calls (the dynamic-slot fetch) are recorded separately in
+    `model_requests` and, unless `models_body` is given, fail (HTTP 404) — so by default
+    the model chain is just the 4 fixed models, no dynamic slot."""
 
-    def __init__(self, status: int = 200, body: bytes = b"", exc: BaseException | None = None):
+    def __init__(
+        self,
+        status: int = 200,
+        body: bytes = b"",
+        exc: BaseException | None = None,
+        models_status: int = 404,
+        models_body: bytes = b"",
+    ):
         self.status, self.body, self.exc = status, body, exc
+        self.models_status, self.models_body = models_status, models_body
         self.requests: list = []
+        self.model_requests: list = []
 
     def open(self, req, timeout=None):
+        if req.get_method() == "GET":
+            self.model_requests.append((req, timeout))
+            if self.models_status >= 400:
+                raise urllib.error.HTTPError(
+                    req.full_url, self.models_status, "err", {}, io.BytesIO(self.models_body)
+                )
+            return _Resp(self.models_status, self.models_body)
         self.requests.append((req, timeout))
         if self.exc is not None:
             raise self.exc
@@ -133,8 +153,10 @@ class CapturingServer:
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.delenv(ask.API_KEY_ENV, raising=False)
+    ask._model_chain_mem_cache.clear()
     yield
     diagnostics.clear_secrets()
+    ask._model_chain_mem_cache.clear()
 
 
 # --------------------------------------------------------------------------- no-data guarantee
@@ -191,8 +213,10 @@ def test_no_row_data_is_ever_sent(sentinel_session):
     assert "label" in blob and "VARCHAR" in blob and "other_thing" in blob
     assert req["headers"]["Authorization"] == f"Bearer {FAKE_KEY}"
     assert req["headers"]["X-Title"] == "Floe"
-    # The body sent is exactly the previewed body.
-    assert req["body"].decode("utf-8") == preview_request(messages, settings)
+    # The body sent is exactly the previewed body (first model in the chain succeeded).
+    assert req["body"].decode("utf-8") == preview_request(messages)
+    assert result.model == "synthetic/model-a"  # from the fake reply's top-level "model"
+    assert result.attempts == ((MODEL_CHAIN[0], "ok"),)
 
 
 @pytest.mark.parametrize(
@@ -313,17 +337,16 @@ def test_pick_focus_views():
 def test_settings_round_trip_and_key_never_in_json(tmp_path):
     from floe.core import paths
 
-    assert load_settings() == AskSettings()  # missing file -> defaults, disabled, no model
-    assert AskSettings().enabled is False and AskSettings().model == ""
-    s = AskSettings(
-        enabled=True, model="synthetic/model-b", base_url="http://x.invalid/v1", timeout_s=7
-    )
+    assert load_settings() == AskSettings()  # missing file -> defaults, disabled
+    assert AskSettings().enabled is False
+    s = AskSettings(enabled=True, base_url="http://x.invalid/v1", timeout_s=7)
     save_settings(s)
     path = paths.app_support_dir() / "ask_settings.json"
     assert path.exists()
     if sys.platform != "win32":  # POSIX mode bits; Windows only has a read-only flag
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     assert load_settings() == s
+    assert "model" not in json.loads(path.read_text())
 
     set_api_key(FAKE_KEY)
     save_settings(s)
@@ -339,6 +362,28 @@ def test_settings_round_trip_and_key_never_in_json(tmp_path):
     assert load_settings() == AskSettings()
 
 
+def test_old_settings_file_with_model_field_loads_fine(tmp_path):
+    """A settings file written by a version of Floe that still had a user-chosen model
+    must load without error; the old `model` value is simply ignored."""
+    from floe.core import paths
+
+    path = paths.app_support_dir() / "ask_settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "model": "some/old-model:free",
+                "base_url": "http://old.invalid/v1",
+                "timeout_s": 42,
+            }
+        )
+    )
+    settings = load_settings(path)
+    assert settings == AskSettings(enabled=True, base_url="http://old.invalid/v1", timeout_s=42)
+    assert not hasattr(settings, "model")
+
+
 def test_api_key_env_fallback_and_registered(monkeypatch):
     assert get_api_key() is None
     monkeypatch.setenv(ask.API_KEY_ENV, FAKE_KEY)
@@ -352,9 +397,8 @@ def test_api_key_env_fallback_and_registered(monkeypatch):
 @pytest.mark.parametrize(
     "settings,key,needle",
     [
-        (AskSettings(enabled=False, model="m/x"), FAKE_KEY, "turned off"),
-        (AskSettings(enabled=True, model=""), FAKE_KEY, "No model"),
-        (AskSettings(enabled=True, model="m/x"), None, "API key"),
+        (AskSettings(enabled=False), FAKE_KEY, "turned off"),
+        (AskSettings(enabled=True), None, "API key"),
     ],
 )
 def test_not_configured(settings, key, needle):
@@ -378,45 +422,77 @@ def test_client_success():
     assert isinstance(result, AskResult)
     assert result.sql == "-- count\nSELECT count(*) FROM gold_summary"
     assert result.model == "synthetic/model-a" and result.elapsed_ms >= 0
+    assert result.attempts == ((MODEL_CHAIN[0], "ok"),)
+    assert result.fell_back is False
+    assert len(opener.requests) == 1  # the first model in the chain succeeded
     req, timeout = opener.requests[0]
-    assert timeout == 9
+    assert 0 < timeout <= 9
     assert req.full_url == "http://fake.invalid/api/v1/chat/completions"
     assert req.get_method() == "POST"
     body = json.loads(req.data)
-    assert body == {"model": "synthetic/model-a", "messages": _messages(), "temperature": 0}
+    assert body == {"model": MODEL_CHAIN[0], "messages": _messages(), "temperature": 0}
     assert req.get_header("Authorization") == f"Bearer {FAKE_KEY}"
     assert req.get_header("Content-type") == "application/json"
-    assert FAKE_KEY not in preview_request(_messages(), settings)
+    assert FAKE_KEY not in preview_request(_messages())
 
 
 @pytest.mark.parametrize(
-    "opener,exc_type",
+    "opener,exc_type,needle",
     [
-        (FakeOpener(401, b'{"error":{"message":"bad ' + _KEY_B + b'"}}'), AskAuthError),
-        (FakeOpener(402, b"{}"), AskQuotaError),
-        (FakeOpener(429, b'{"error":{"message":"slow down"}}'), AskRateLimited),
-        (FakeOpener(500, b"oops " + FAKE_KEY.encode()), AskUnavailable),
-        (FakeOpener(503, b""), AskUnavailable),
-        (FakeOpener(exc=TimeoutError("timed out")), AskUnavailable),
-        (FakeOpener(exc=urllib.error.URLError(TimeoutError("timed out"))), AskUnavailable),
-        (FakeOpener(exc=urllib.error.URLError(ConnectionRefusedError())), AskUnavailable),
-        (FakeOpener(400, b'{"error":{"message":"m ' + _KEY_B + b' not found"}}'), AskError),
-        (FakeOpener(body=b"not json"), AskError),
-        (FakeOpener(body=b'{"choices": []}'), AskError),
-        (FakeOpener(body=b'{"error": {"code": 429, "message": "x"}}'), AskRateLimited),
-        (FakeOpener(body=_ok_body("")), AskError),
+        (FakeOpener(401, b'{"error":{"message":"bad ' + _KEY_B + b'"}}'), AskAuthError, "API key"),
+        (FakeOpener(402, b"{}"), AskQuotaError, "credits"),
     ],
 )
-def test_client_errors_are_typed_and_redacted(opener, exc_type, caplog):
+def test_no_fallback_on_auth_and_quota_errors(opener, exc_type, needle, caplog):
+    """A bad key or no credits is not a per-model problem: raise immediately, after
+    exactly one attempt, never trying the rest of the chain."""
     caplog.set_level(logging.DEBUG, logger="floe")
     client = OpenRouterClient(_settings(), FAKE_KEY, opener=opener)
     with pytest.raises(exc_type) as ei:
         client.generate(_messages())
     err = ei.value
+    assert needle in err.user_message()
+    assert err.attempts == ()
+    for text in (str(err), err.user_message(), repr(err.args), caplog.text):
+        assert FAKE_KEY not in text
+    assert len(opener.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "opener,reason_needle",
+    [
+        (FakeOpener(429, b'{"error":{"message":"slow down"}}'), "429"),
+        (FakeOpener(500, b"oops " + FAKE_KEY.encode()), "server error"),
+        (FakeOpener(503, b""), "server error"),
+        (FakeOpener(404, b'{"error":{"message":"missing"}}'), "404"),
+        (
+            FakeOpener(400, b'{"error":{"message":"model ' + _KEY_B + b' not found"}}'),
+            "unavailable",
+        ),
+        (FakeOpener(exc=TimeoutError("timed out")), "timeout"),
+        (FakeOpener(exc=urllib.error.URLError(TimeoutError("timed out"))), "timeout"),
+        (FakeOpener(exc=urllib.error.URLError(ConnectionRefusedError())), "timeout"),
+        (FakeOpener(body=b"not json"), "JSON"),
+        (FakeOpener(body=b'{"choices": []}'), "response"),
+        (FakeOpener(body=b'{"error": {"code": 429, "message": "x"}}'), "429"),
+        (FakeOpener(body=_ok_body("")), "empty"),
+    ],
+)
+def test_fallback_exhausts_chain_then_raises_unavailable(opener, reason_needle, caplog):
+    caplog.set_level(logging.DEBUG, logger="floe")
+    client = OpenRouterClient(_settings(), FAKE_KEY, opener=opener)
+    with pytest.raises(AskUnavailable) as ei:
+        client.generate(_messages())
+    err = ei.value
+    assert "All free models are busy or unavailable" in err.user_message()
+    assert [m for m, _ in err.attempts] == list(MODEL_CHAIN)
+    assert all(
+        reason_needle in outcome or reason_needle in outcome.lower() for _, outcome in err.attempts
+    )
+    assert len(opener.requests) == len(MODEL_CHAIN)  # every model was tried
     for text in (str(err), err.user_message(), repr(err.args), caplog.text):
         assert FAKE_KEY not in text
     assert "count rows" not in caplog.text  # never log the prompt
-    assert "ask model=synthetic/model-a status=" in caplog.text
 
 
 def test_client_logs_metadata_only(caplog):
@@ -434,6 +510,118 @@ def test_generate_rejects_bad_messages():
         client.generate([{"role": "user", "content": "x", "rows": [1]}])
     with pytest.raises(TypeError):
         client.generate(pd.DataFrame({"a": [1]}))
+
+
+# --------------------------------------------------------------------------- model chain
+
+
+def _model(id_: str, context_length: int = 32_000) -> dict:
+    return {"id": id_, "context_length": context_length}
+
+
+def test_model_chain_fixed_order_and_length():
+    assert MODEL_CHAIN == (
+        "qwen/qwen3-coder:free",
+        "openai/gpt-oss-120b:free",
+        "openai/gpt-oss-20b:free",
+        "openrouter/free",
+    )
+
+
+def test_get_model_chain_fetch_failure_yields_four_fixed_models():
+    opener = FakeOpener(body=_ok_body("x"), models_status=500)
+    chain = get_model_chain(_settings(), FAKE_KEY, opener=opener, now=1000.0)
+    assert chain == list(MODEL_CHAIN)
+
+
+def test_get_model_chain_picks_coder_model_for_dynamic_slot():
+    models = {
+        "data": [
+            _model("qwen/qwen3-coder:free"),
+            _model("openai/gpt-oss-120b:free"),
+            _model("openai/gpt-oss-20b:free"),
+            _model("openrouter/free"),
+            _model("some-org/great-coder-model:free", context_length=200_000),
+            _model("some-org/generic-chat:free", context_length=500_000),
+            _model("some-org/paid-model"),  # not :free -> never picked
+        ]
+    }
+    opener = FakeOpener(
+        body=_ok_body("x"), models_status=200, models_body=json.dumps(models).encode()
+    )
+    chain = get_model_chain(_settings(), FAKE_KEY, opener=opener, now=1000.0)
+    assert chain == [
+        "qwen/qwen3-coder:free",
+        "openai/gpt-oss-120b:free",
+        "openai/gpt-oss-20b:free",
+        "some-org/great-coder-model:free",
+        "openrouter/free",
+    ]
+
+
+def test_get_model_chain_prefers_larger_context_within_a_tier():
+    models = {
+        "data": [
+            _model("org-a/instruct-small:free", context_length=8_000),
+            _model("openai/instruct-big:free", context_length=300_000),
+        ]
+    }
+    opener = FakeOpener(
+        body=_ok_body("x"), models_status=200, models_body=json.dumps(models).encode()
+    )
+    chain = get_model_chain(_settings(), FAKE_KEY, opener=opener, now=1000.0)
+    # Both are non-coder well-known/instruct tier: the larger context wins the slot.
+    assert chain[-2] == "openai/instruct-big:free"
+
+
+def test_get_model_chain_drops_missing_fixed_id_when_fetch_succeeds():
+    models = {
+        "data": [
+            _model("openai/gpt-oss-120b:free"),
+            _model("openai/gpt-oss-20b:free"),
+            _model("openrouter/free"),
+            # qwen/qwen3-coder:free is missing from the live list -> dropped.
+        ]
+    }
+    opener = FakeOpener(
+        body=_ok_body("x"), models_status=200, models_body=json.dumps(models).encode()
+    )
+    chain = get_model_chain(_settings(), FAKE_KEY, opener=opener, now=1000.0)
+    assert "qwen/qwen3-coder:free" not in chain
+    assert chain[0] == "openai/gpt-oss-120b:free"
+    assert chain[-1] == "openrouter/free"
+
+
+def test_get_model_chain_caches_for_24h():
+    models = {"data": [_model("some-org/great-coder-model:free")]}
+    opener = FakeOpener(
+        body=_ok_body("x"), models_status=200, models_body=json.dumps(models).encode()
+    )
+    settings = _settings()
+    chain1 = get_model_chain(settings, FAKE_KEY, opener=opener, now=1000.0)
+    assert len(opener.model_requests) == 1
+    # Well within 24h: no re-fetch, same chain, no extra request.
+    chain2 = get_model_chain(settings, FAKE_KEY, opener=opener, now=1000.0 + 3600)
+    assert chain2 == chain1
+    assert len(opener.model_requests) == 1
+    # Past 24h: re-fetch.
+    get_model_chain(settings, FAKE_KEY, opener=opener, now=1000.0 + 24 * 3600 + 1)
+    assert len(opener.model_requests) == 2
+
+
+def test_get_model_chain_sends_key_but_does_not_require_it():
+    models = {"data": []}
+    opener = FakeOpener(models_status=200, models_body=json.dumps(models).encode())
+    get_model_chain(_settings(), FAKE_KEY, opener=opener, now=1000.0)
+    req, _ = opener.model_requests[0]
+    assert req.get_method() == "GET"
+    assert req.full_url == "http://fake.invalid/api/v1/models"
+    assert req.get_header("Authorization") == f"Bearer {FAKE_KEY}"
+    ask._model_chain_mem_cache.clear()
+    opener2 = FakeOpener(models_status=200, models_body=json.dumps(models).encode())
+    get_model_chain(_settings(), None, opener=opener2, now=1000.0 + 24 * 3600 + 1)
+    req2, _ = opener2.model_requests[0]
+    assert req2.get_header("Authorization") is None
 
 
 # --------------------------------------------------------------------------- output handling

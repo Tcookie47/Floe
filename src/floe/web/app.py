@@ -34,10 +34,10 @@ from floe.core.errors import (
 )
 from floe.core.history import HistoryStore
 from floe.core.profiles import Profile, ProfileStore
-from floe.web import api_ask, api_data, api_profiles
+from floe.web import api_ask, api_data, api_profiles, control
 from floe.web.jobs import JobManager, TooManyJobs
 from floe.web.prefs import PrefsStore
-from floe.web.security import DEFAULT_TOKEN_TTL, SecurityMiddleware
+from floe.web.security import DEFAULT_TOKEN_TTL, LaunchTokens, SecurityMiddleware
 from floe.web.serialize import error_payload
 from floe.web.sessions import ProfileNotFound, SessionFactory, SessionManager
 from floe.web.state import ApiError, ConnectionTester, WebState
@@ -119,13 +119,19 @@ def create_app(
     api_key: str | None = None,
     token_ttl: float = DEFAULT_TOKEN_TTL,
     on_token_used: Callable[[], None] | None = None,
+    control_key: str | None = None,
+    on_shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
-    """Build the app. `token` is the single-use launch token; `port` the port it's served
-    on (used for the Host / Origin allow-lists); `api_key` the per-launch key required in
-    the `X-Floe-Auth` header of every API request (random if not given, and available as
-    `app.state.api_key`)."""
+    """Build the app. `token` is the single-use startup launch token; `port` the port
+    it's served on (used for the Host / Origin allow-lists); `api_key` the per-launch key
+    required in the `X-Floe-Auth` header of every API request (random if not given, and
+    available as `app.state.api_key`). `control_key` enables the `/_control/...` routes
+    (`floe show` / `floe stop`); `/_control/shutdown` calls `on_shutdown`. The launch
+    tokens are `app.state.launch_tokens`."""
     api_key = api_key or secrets.token_urlsafe(32)
     diagnostics.register_secret(api_key)
+    diagnostics.register_secret(control_key)
+    tokens = LaunchTokens(token_ttl)
     store = store if store is not None else ProfileStore()
     state = WebState(
         store=store,
@@ -146,6 +152,7 @@ def create_app(
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
+        tokens.clear()  # removes any launch files still waiting
         state.shutdown()
 
     app = FastAPI(
@@ -161,6 +168,11 @@ def create_app(
     app.include_router(api_profiles.router)
     app.include_router(api_data.router)
     app.include_router(api_ask.router)
+    if control_key:
+        app.state.control = control.Control(
+            tokens=tokens, port=port, control_key=control_key, on_shutdown=on_shutdown
+        )
+        app.include_router(control.router)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     # Field defaults for the profile form's "New" (non-secret fields only).
@@ -175,6 +187,7 @@ def create_app(
         )
 
     app.state.api_key = api_key
+    app.state.launch_tokens = tokens
     app.add_middleware(
         SecurityMiddleware,
         token=token,
@@ -182,5 +195,7 @@ def create_app(
         api_key=api_key,
         token_ttl=token_ttl,
         on_token_used=on_token_used,
+        tokens=tokens,
+        control_key=control_key,
     )
     return app

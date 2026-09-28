@@ -33,8 +33,54 @@ floe serve
 **What you'll see:** Floe binds to `127.0.0.1` on a random free port (unless
 you pass `--port`), prints a one-time link of the form
 `http://127.0.0.1:<port>/?token=…`, and opens it in your default browser.
-Keep the terminal open — closing it, or pressing **Ctrl+C**, stops the
-server.
+In this (foreground) mode, keep the terminal open — closing it, or pressing
+**Ctrl+C**, stops the server.
+
+### Background mode: `floe serve --background`
+
+```
+floe serve --background
+```
+
+starts Floe as a detached process that keeps running after you close the
+terminal (and across laptop sleep). It waits until the server answers, prints
+a one-time link (and opens it unless you add `--no-browser`), then returns:
+
+```
+Floe is running in the background (PID 12345). Use `floe show` to get a new link, `floe stop` to stop it.
+```
+
+Only one Floe runs at a time: if one is already running, `floe serve` (with
+or without `--background`) doesn't start another — it says so and prints a
+fresh link, like `floe show`. The server's output goes to
+`server-output.log` in Floe's logs directory (owner-only, never contains a
+link or token).
+
+### `floe show` — get a fresh link
+
+```
+floe show          # print a new one-time link
+floe show --open   # ...and open it in your default browser
+```
+
+prints `Floe <version> is running (PID …, since …, port …)` and a **new**
+one-time link. Like every Floe link it works **once, within two minutes**;
+run `floe show` again whenever you need another. `--open` hands the browser a
+private (owner-only) file that redirects to the link, so the token never
+appears on a command line. If Floe isn't running, `floe show` says
+`Floe isn't running. Start it with floe serve --background.` and exits with
+status 1. `floe show` works for a foreground `floe serve` too (from another
+terminal).
+
+### `floe stop`
+
+```
+floe stop
+```
+
+asks the running Floe (foreground or background) to shut down cleanly
+(running queries are cancelled), waits up to 10 seconds, and terminates it if
+it didn't exit.
 
 ### `floe serve --no-browser`
 
@@ -48,7 +94,8 @@ With `--no-browser`, Floe only prints the link — it does not try to launch a
 browser. **Copy the printed link into the address bar within two minutes**:
 the launch token expires after 2 minutes, and the link is **single-use** —
 once a browser has loaded it, the token is consumed (the private redirect
-file is deleted immediately after use, on expiry, or at shutdown).
+file is deleted immediately after use, on expiry, or at shutdown). If it
+expired, `floe show` prints a new one.
 
 ### Other flags
 
@@ -57,20 +104,23 @@ file is deleted immediately after use, on expiry, or at shutdown).
 | `--port N` | Listen on port `N` instead of a random free port. |
 | `--host 127.0.0.1` | Must be `127.0.0.1` or `localhost` — Floe refuses any other value (it serves health data and only runs locally). |
 | `--no-browser` | Don't open a browser; just print the link. |
+| `--background` | Run detached from the terminal (see above). |
 | `--version` | Print the version and commit, then exit. |
 
 Running `floe` with no subcommand behaves exactly like `floe serve`.
 
-### Stopping and reopening
+### Sleep, closed tabs and reopening
 
-- **Ctrl+C** in the terminal stops the server.
-- The session cookie set by the launch link stays valid for as long as the
-  server keeps running, so if you close every Floe tab you can just open a
-  **new tab** at the same base URL (without needing a fresh token) as long as
-  `floe serve` is still running.
-- If you stopped `floe serve` (or the token already expired/was used and you
-  have no open tab left), you must run `floe serve` again to get a fresh
-  link.
+- Laptop sleep doesn't sign you out: when the machine wakes, open Floe tabs
+  keep working as long as the server is still running (the session cookie
+  lasts for the server's lifetime; each tab keeps its API key in
+  `sessionStorage`).
+- A new tab opened by hand picks up the session from an open Floe tab.
+- After closing **every** Floe tab (or in another browser), run
+  `floe show --open` (or `floe show` and paste the link) to get back in.
+  Tabs you already have open keep working when you open a new link.
+- `floe stop` (or **Ctrl+C** for a foreground `floe serve`) stops the server;
+  after that, start it again with `floe serve --background`.
 
 ### Troubleshooting "Open Floe from the link printed in the terminal"
 
@@ -80,8 +130,8 @@ already expired or was used). Fixes:
 - Reuse a tab that is already open on Floe (new tabs pick up the session
   automatically over a same-origin broadcast, as long as one Floe tab is
   still open).
-- Otherwise, go back to the terminal, stop Floe (Ctrl+C) and run
-  `floe serve` again for a fresh link.
+- Otherwise run `floe show --open` for a fresh link. If that says Floe isn't
+  running, start it with `floe serve --background`.
 
 ---
 
@@ -400,6 +450,10 @@ and Floe asks an LLM via [OpenRouter](https://openrouter.ai) to draft SQL
 for you. **The generated SQL is never run automatically** — it's placed in
 the editor for you to review and run yourself.
 
+There is no model to choose: Ask always tries a fixed, ordered list of free
+models and automatically falls back to the next one if one is busy,
+unavailable, or times out.
+
 ### Set up an OpenRouter account and key
 
 1. Create a free account at [openrouter.ai](https://openrouter.ai).
@@ -414,18 +468,29 @@ policy**, go to OpenRouter's **Settings → Privacy** and allow the
 providers/data policies required by free models — free providers may log
 prompts.
 
-### Recommended free models (as of September 2026)
+### The automatic model chain and fallback
 
-Enter the model ID exactly as shown in Floe's Ask settings:
+Ask tries these free models, in order, moving to the next one whenever a
+model times out, is rate-limited, returns a server error, or turns out to be
+unavailable:
 
-| Priority | Model ID | Notes |
+| Order | Model ID | Notes |
 |---|---|---|
-| Primary | `qwen/qwen3-coder:free` | Qwen3 Coder 480B A35B — strong code/SQL generation, very long context. |
-| Fallback | `openai/gpt-oss-20b:free` | Fast, good at SQL, 131K context. |
-| Last resort | `openrouter/free` | OpenRouter picks a random available free model — quality varies. |
+| 1 | `qwen/qwen3-coder:free` | Qwen3 Coder 480B A35B — strong code/SQL generation, very long context. |
+| 2 | `openai/gpt-oss-120b:free` | Large, capable general model. |
+| 3 | `openai/gpt-oss-20b:free` | Fast, good at SQL, 131K context. |
+| 4 | *(dynamic)* | The best other free model Floe can currently find on OpenRouter — a coder/code model if one exists, else a general chat/instruct model from a well-known provider, picked by fetching OpenRouter's public model list (cached up to 24 hours) and skipped if that list can't be fetched. |
+| 5 | `openrouter/free` | Last resort: OpenRouter picks a random available free model. Always tried last. |
 
-Free model availability changes over time. Find current free models at
-<https://openrouter.ai/models?max_price=0> and pick a coder/instruct model.
+Each attempt has its own ~25-second timeout, and the whole question has an
+overall time budget (the **Timeout (s)** setting, default 90 seconds) split
+across every model tried. A bad API key or an account with no credits stops
+immediately — those aren't per-model problems, so there's no point trying
+the rest of the chain. If every model in the chain fails, Ask reports "All
+free models are busy or unavailable right now — try again in a minute."
+
+Free model availability on OpenRouter changes over time; the dynamic slot
+adapts to that automatically, so there's nothing for you to update here.
 
 ### Configure Ask in Floe
 
@@ -435,9 +500,13 @@ Open **Help ▾ → Ask settings…** (or **Ask…** panel → **Settings…**):
 |---|---|---|
 | Enabled | Turns Ask on/off. | off |
 | API key | Your OpenRouter key. Stored in the OS keyring, write-only (shows "(saved)"); without a usable keyring, set `FLOE_OPENROUTER_API_KEY` instead. | — |
-| Model ID | Any OpenRouter model ID (e.g. one of the free models above). | — |
+
+Under **Advanced**:
+
+| Field | Meaning | Default |
+|---|---|---|
 | Base URL | The OpenRouter API base. Must be `https://` unless it points at this machine (`127.0.0.1`/`localhost`). | `https://openrouter.ai/api/v1` |
-| Timeout (s) | Request timeout, 1–600 seconds. | `60` |
+| Timeout (s) | Overall time budget for a question, across every model tried, 1–600 seconds. | `90` |
 
 ### Using it
 
@@ -446,11 +515,14 @@ Open **Help ▾ → Ask settings…** (or **Ask…** panel → **Settings…**):
 3. Choose **Replace editor** or **Insert at cursor** for where the SQL
    should land.
 4. Click **What will be sent** to preview the exact request body first
-   (schema only, no API key, no rows).
+   (schema only, no API key, no rows) — shown for the first model in the
+   chain; the model actually used may change if Ask falls back.
 5. Click **Generate SQL**. The result lands in the editor per your chosen
    mode; it is **never run for you** — review it and click **Run**
-   yourself. Any warnings (e.g. the SQL looks like it would fail the
-   read-only check) are shown under the panel.
+   yourself. A small note under the panel says **"Generated by
+   &lt;model&gt;"**, plus how many models Ask had to fall back through, if
+   any. Any warnings (e.g. the SQL looks like it would fail the read-only
+   check) are shown under that.
 
 ### Privacy — what is sent
 

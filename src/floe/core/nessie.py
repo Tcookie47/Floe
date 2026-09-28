@@ -1,4 +1,6 @@
-"""Read-only Nessie REST v2 client: token cache, refs, branch heads, entries, pointers (SPEC §5).
+"""Read-only Nessie REST v2 client: token cache, refs, heads, entries, pointers, commit log.
+
+SPEC §5 and §15.7 (branch timeline).
 
 Uses stdlib `urllib` only. No write operations exist here, by design.
 """
@@ -17,6 +19,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, Literal
 
@@ -34,6 +37,8 @@ log = logging.getLogger("floe.nessie")
 
 TOKEN_REFRESH_MARGIN_SECONDS = 60.0
 ENTRIES_PAGE_SIZE = 500
+HISTORY_PAGE_SIZE = 50
+MAX_HISTORY_PAGE_SIZE = 250
 KEY_ELEMENT_SEP = "\u001d"
 
 CatalogStatus = Literal["unknown", "ok", "stale"]
@@ -82,6 +87,93 @@ class TableKey:
         """Nessie v2 path encoding: '.'-joined, in-element '.' → \\u001D, URL-quoted."""
         joined = ".".join(e.replace(".", KEY_ELEMENT_SEP) for e in self.elements)
         return urllib.parse.quote(joined, safe="")
+
+
+@dataclass(frozen=True)
+class CommitInfo:
+    """One Nessie commit. `touched` is None when the server didn't return operations."""
+
+    hash: str
+    time: datetime | None  # commit time, UTC
+    author: str | None
+    committer: str | None
+    message: str
+    touched: tuple[TableKey, ...] | None
+    author_time: datetime | None = None
+
+
+@dataclass(frozen=True)
+class HistoryPage:
+    entries: list[CommitInfo]
+    next_token: str | None
+    operations_available: bool
+
+
+_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
+def parse_time(value: object) -> datetime | None:
+    """ISO-8601 instant (Nessie's `commitTime`, up to nanoseconds) → aware UTC datetime."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = _FRACTION.sub(r"\1", value.strip())
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+_TOUCHING_OPS = frozenset({"PUT", "DELETE"})
+_NON_TABLE_CONTENT = frozenset({"NAMESPACE", "ICEBERG_VIEW", "DELTA_LAKE_TABLE", "UDF"})
+
+
+def _touched_keys(operations: object) -> tuple[TableKey, ...]:
+    """Table keys a commit's operations PUT or DELETE (namespaces / views skipped)."""
+    keys: list[TableKey] = []
+    if not isinstance(operations, list):
+        return ()
+    for op in operations:
+        if not isinstance(op, dict) or str(op.get("type", "")).upper() not in _TOUCHING_OPS:
+            continue
+        content = op.get("content")
+        if isinstance(content, dict) and str(content.get("type", "")).upper() in _NON_TABLE_CONTENT:
+            continue
+        elements = (op.get("key") or {}).get("elements")
+        if not isinstance(elements, list) or not elements:
+            continue
+        key = TableKey(tuple(str(e) for e in elements))
+        if key not in keys:
+            keys.append(key)
+    return tuple(keys)
+
+
+def parse_log_entry(entry: dict[str, Any], with_operations: bool) -> CommitInfo:
+    meta = entry.get("commitMeta") or {}
+    authors = meta.get("authors")
+    if isinstance(authors, list) and authors:
+        author = ", ".join(str(a) for a in authors if a)
+    else:
+        author = meta.get("author")
+    committer = meta.get("committer")
+    touched = (
+        _touched_keys(entry["operations"])
+        if with_operations and entry.get("operations") is not None
+        else None
+    )
+    return CommitInfo(
+        hash=str(meta.get("hash") or entry.get("hash") or ""),
+        time=parse_time(meta.get("commitTime")),
+        author=str(author) if author else None,
+        committer=str(committer) if committer else None,
+        message=str(meta.get("message") or ""),
+        touched=touched,
+        author_time=parse_time(meta.get("authorTime")),
+    )
 
 
 @dataclass(frozen=True)
@@ -215,6 +307,11 @@ def _filename(location: str) -> str:
     return PurePosixPath(urllib.parse.urlsplit(location).path).name
 
 
+def metadata_file_name(location: str) -> str:
+    """The file name of a table location (no directories, no container / account)."""
+    return _filename(location)
+
+
 class NessieClient:
     """Thread-safe, read-only Nessie v2 client bound to one profile."""
 
@@ -244,6 +341,10 @@ class NessieClient:
 
         self._pointer_lock = threading.Lock()
         self._pointers: dict[tuple[str, str], Pointer] = {}
+
+        # False once the server rejected `fetch=ALL` or ignored it (no operations):
+        # the commit log is then requested message-only from then on.
+        self._history_operations: bool | None = None
 
     # ----- status ----------------------------------------------------------
     @property
@@ -498,6 +599,75 @@ class NessieClient:
         with self._pointer_lock:
             self._pointers[cache_key] = ptr
         return ptr
+
+    # ----- commit log ------------------------------------------------------
+    @property
+    def history_operations_supported(self) -> bool | None:
+        """None = not known yet; False = the server doesn't return commit operations."""
+        return self._history_operations
+
+    def history(
+        self,
+        ref: str,
+        *,
+        page_token: str | None = None,
+        max_records: int = HISTORY_PAGE_SIZE,
+        with_operations: bool = True,
+    ) -> HistoryPage:
+        """One page of `ref`'s commit log, newest first (`GET /trees/<ref>/history`).
+
+        With `with_operations`, asks for `fetch=ALL` so each commit carries the keys it
+        changed. If the server rejects that (4xx) or returns no operations, the log is
+        fetched message-only (`touched=None`) — and this client remembers it, so later
+        pages don't retry. Only counts are logged, never commit messages.
+        """
+        rel = f"trees/{urllib.parse.quote(ref, safe='')}/history"
+        size = max(1, min(int(max_records), MAX_HISTORY_PAGE_SIZE))
+        query: dict[str, Any] = {"max-records": size}
+        if page_token:
+            query["page-token"] = page_token
+        want_ops = with_operations and self._history_operations is not False
+        data: Any = None
+        if want_ops:
+            try:
+                status, data = self._get_json(rel, {**query, "fetch": "ALL"})
+            except NessieHTTPError as exc:
+                if not 400 <= exc.status < 500:
+                    raise
+                log.info(
+                    "History of %s: fetch=ALL rejected (HTTP %s); using message-only log",
+                    ref,
+                    exc.status,
+                )
+                self._history_operations = False
+                want_ops = False
+            else:
+                if status != 200:
+                    raise NessieHTTPError(rel, status)
+        if not want_ops:
+            status, data = self._get_json(rel, query)
+            if status != 200:
+                raise NessieHTTPError(rel, status)
+        data = data or {}
+        raw = [e for e in data.get("logEntries") or [] if isinstance(e, dict)]
+        if want_ops and raw and all(e.get("operations") is None for e in raw):
+            if self._history_operations is None:
+                log.info("History of %s: server returned no operations; message-only", ref)
+            self._history_operations = False
+            want_ops = False
+        elif want_ops and raw:
+            self._history_operations = True
+        entries = [parse_log_entry(e, want_ops) for e in raw]
+        token = data.get("token")
+        next_token = str(token) if data.get("hasMore") and token else None
+        log.info(
+            "History of %s: %d commit(s)%s%s",
+            ref,
+            len(entries),
+            " with operations" if want_ops else "",
+            ", more available" if next_token else "",
+        )
+        return HistoryPage(entries, next_token, want_ops)
 
     def clear_pointers(self, ref: str | None = None) -> None:
         with self._pointer_lock:

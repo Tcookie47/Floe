@@ -23,7 +23,7 @@ from typing import Any
 
 from floe.core import paths
 
-TABS = ("preview", "schema", "sql")
+TABS = ("preview", "schema", "sql", "timeline")
 MAX_NAME = 200
 MAX_EDITOR_TEXT = 200_000  # characters per profile
 MAX_FILE_BYTES = 2_000_000

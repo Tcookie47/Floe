@@ -1,5 +1,5 @@
 // Floe web UI entry point (SPEC §8, §15). Wires the top bar, table tree, Preview /
-// Schema / SQL tabs, results grids, profiles dialog, Ask panel, Help menu, keyboard
+// Schema / SQL / Timeline tabs, results grids, profiles dialog, Ask panel, Help menu, keyboard
 // shortcuts and UI prefs to the JSON API. Loaded as an external ES module (CSP).
 
 import { api, authHeaders, enc, ensureApiKey, errorText, JobHandle, setUnauthorizedHandler } from "./js/api.js";
@@ -8,11 +8,12 @@ import { ResultsView } from "./js/grid.js";
 import { TableTree } from "./js/tree.js";
 import { ProfilesDialog } from "./js/profiles.js";
 import { AskPanel } from "./js/ask.js";
+import { TIMELINE_CHANNELS, TimelineView } from "./js/timeline.js";
 import { TextareaEditor } from "./js/fallback_editor.js";
 
 const PAGE_SIZE = 500;
-const TABS = ["preview", "schema", "sql"];
-const WORK_CHANNELS = ["preview", "schema", "sql", "ask"];
+const TABS = ["preview", "schema", "sql", "timeline"];
+const WORK_CHANNELS = ["preview", "schema", "sql", "ask", ...TIMELINE_CHANNELS];
 const CATALOG = {
   ok: ["Catalog OK", "Nessie answered the last request."],
   stale: ["Catalog unreachable, showing last known state", "The last head refresh failed; Floe is using the last known head."],
@@ -51,6 +52,7 @@ let profilesDialog = null;
 let previewView = null;
 let schemaView = null;
 let sqlView = null;
+let timeline = null;
 
 // ----- prefs ------------------------------------------------------------------------------
 let pendingPrefs = {};
@@ -149,6 +151,7 @@ function setTab(name, { save = true } = {}) {
   }
   if (save) savePref("last_tab", name);
   if (name === "sql" && editor) setTimeout(() => editor.focus(), 0);
+  if (name === "timeline" && timeline) timeline.activate();
 }
 
 function updateEditorSchema() {
@@ -186,6 +189,7 @@ function resetWorkspace(message) {
   previewView.showMessage("");
   schemaView.showMessage("");
   tree.showMessage(message);
+  if (timeline) timeline.reset();
 }
 
 async function selectProfile(name) {
@@ -276,6 +280,7 @@ async function loadTables(seq, fetcher, reselect) {
   tree.setTables(data.tables);
   updateEditorSchema();
   status(`${data.tables.length} tables on ${S.ref}.`, 5000);
+  if (timeline) timeline.invalidate();
   if (reselect && tree.select(reselect)) return;
 }
 
@@ -301,6 +306,11 @@ async function refresh() {
 function onTableSelected(table) {
   S.selected = table;
   runTableWork();
+}
+
+function showTableHistory(table) {
+  setTab("timeline");
+  timeline.showTable(table);
 }
 
 function onTableActivated(table) {
@@ -607,7 +617,7 @@ function onKeyDown(e) {
     $("#tree-filter").select();
     return;
   }
-  if (e.altKey && !mod && ["Digit1", "Digit2", "Digit3"].includes(e.code)) {
+  if (e.altKey && !mod && ["Digit1", "Digit2", "Digit3", "Digit4"].includes(e.code)) {
     e.preventDefault();
     setTab(TABS[Number(e.code.slice(-1)) - 1]);
     return;
@@ -709,7 +719,7 @@ function showSignedOut() {
   document.body.replaceChildren(h("main", { class: "signed-out", "data-testid": "signed-out" },
     h("h1", { text: "Floe" }),
     h("p", { text: "This tab isn't signed in. Open Floe from the link printed in the terminal where you ran `floe serve`." }),
-    h("p", { text: "That link works once. If it was already used, keep using the Floe tab you opened with it, or stop Floe (Ctrl+C) and run `floe serve` again." })));
+    h("p", { text: "That link works once. If it was already used, keep using the Floe tab you opened with it, or run `floe show --open` in a terminal for a fresh link while Floe is running." })));
 }
 
 async function main() {
@@ -724,6 +734,13 @@ async function main() {
   sqlView = new ResultsView($("#sql-results"), { pageSize: PAGE_SIZE, onExport: exportCsv });
   tree = new TableTree($("#tree"), $("#tree-message"), $("#tree-filter"), {
     onSelect: onTableSelected, onActivate: onTableActivated,
+    menuItems: [{ label: "Show history", action: showTableHistory }],
+  });
+  timeline = new TimelineView({
+    ctx: () => ({
+      profile: S.profile, ref: S.ref, head: S.head,
+      isLocal: Boolean(S.profileData && S.profileData.mode === "local"),
+    }),
   });
   profilesDialog = new ProfilesDialog({ defaults, onChanged: onProfilesChanged });
   wire();

@@ -147,7 +147,7 @@ The Mac app is frozen at v0.9.x. Phases W1–W5 below build the cross-platform l
 - [x] **W4 Packaging:** `floe serve` CLI, wheel release on `v1.*`, Mac release moved to `desktop-v*`, README install per OS.
 - [x] **W5 Ask:** `core/ask.py` prompt builder (schema only, no rows — tested), OpenRouter client, settings, "What will be sent" preview, validate but never run.
 
-- [ ] **W6 Timeline:** freshness overview, Nessie branch commit timeline (messages, touched tables when available), per-table Iceberg snapshot history with chart (SPEC §15.7).
+- [x] **W6 Timeline:** freshness overview, Nessie branch commit timeline (messages, touched tables when available), per-table Iceberg snapshot history with chart (SPEC §15.7).
 
 ## Later
 Nessie commit history / Iceberg snapshot time travel; side-by-side table comparison across branch heads.

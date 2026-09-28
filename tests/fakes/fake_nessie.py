@@ -67,6 +67,12 @@ class FakeNessieState:
     namespaces: dict[str, set[tuple[str, ...]]] = field(default_factory=dict)
     # token -> expiry (time.monotonic)
     tokens: dict[str, float] = field(default_factory=dict)
+    # ref name -> commit log, oldest first (see `FakeNessie.commit`)
+    commits: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # history knobs: reject `fetch=ALL` with HTTP 400 / ignore it (no operations)
+    reject_fetch_all: bool = False
+    omit_operations: bool = False
+    history_page_size: int | None = None
     failures: list[_Failure] = field(default_factory=list)
     requests: list[RequestRecord] = field(default_factory=list)
     token_requests: int = 0
@@ -155,15 +161,90 @@ class FakeNessie:
 
     # ----- scenario knobs --------------------------------------------------
     def set_branch(self, name: str, commit_hash: str | None = None) -> str:
-        """Create a branch or move its head. Returns the new hash."""
+        """Create a branch or move its head. Returns the new hash.
+
+        Moving an existing branch's head also records a (synthetic) commit in its log."""
         with self.lock:
             new_hash = commit_hash or secrets.token_hex(16)
+            if name in self.state.branches and self.state.branches[name] != new_hash:
+                self._record_commit(name, new_hash, "Move head", "fake-bot", (), ())
             self.state.branches[name] = new_hash
             self.state.tables.setdefault(name, {})
             self.state.namespaces.setdefault(name, set())
             return new_hash
 
     move_head = set_branch
+
+    def commit(
+        self,
+        ref: str,
+        message: str,
+        *,
+        author: str = "fake-author",
+        puts: tuple[tuple[str, ...] | str, ...] = (),
+        deletes: tuple[tuple[str, ...] | str, ...] = (),
+        commit_time: float | None = None,
+        move_head: bool = True,
+    ) -> str:
+        """Record a commit on `ref` (and move its head to it unless `move_head=False`)."""
+        with self.lock:
+            if ref not in self.state.branches:
+                self.set_branch(ref)
+            new_hash = secrets.token_hex(16)
+            self._record_commit(ref, new_hash, message, author, puts, deletes, commit_time)
+            if move_head:
+                self.state.branches[ref] = new_hash
+            return new_hash
+
+    def commits(self, ref: str) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self.state.commits.get(ref, []))
+
+    def _record_commit(
+        self,
+        ref: str,
+        commit_hash: str,
+        message: str,
+        author: str,
+        puts: tuple[tuple[str, ...] | str, ...],
+        deletes: tuple[tuple[str, ...] | str, ...],
+        commit_time: float | None = None,
+    ) -> None:
+        def elements(k: tuple[str, ...] | str) -> list[str]:
+            return list(k.split(".")) if isinstance(k, str) else list(k)
+
+        log = self.state.commits.setdefault(ref, [])
+        when = time.time() if commit_time is None else commit_time
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(when))
+        stamp += f".{int((when % 1) * 1_000_000):06d}123Z"  # nanosecond precision, like Java
+        operations = [
+            {
+                "type": "PUT",
+                "key": {"elements": elements(k)},
+                "content": dict(
+                    self.state.tables.get(ref, {}).get(tuple(elements(k)))
+                    or {"type": "ICEBERG_TABLE"}
+                ),
+            }
+            for k in puts
+        ] + [{"type": "DELETE", "key": {"elements": elements(k)}} for k in deletes]
+        log.append(
+            {
+                "commitMeta": {
+                    "hash": commit_hash,
+                    "committer": "fake-committer",
+                    "authors": [author],
+                    "allSignedOffBy": [],
+                    "message": message,
+                    "commitTime": stamp,
+                    "authorTime": stamp,
+                    "properties": {},
+                    "parentCommitHashes": [log[-1]["commitMeta"]["hash"]] if log else [],
+                },
+                "parentCommitHash": log[-1]["commitMeta"]["hash"] if log else "0" * 32,
+                "operations": operations,
+            }
+        )
 
     def remove_branch(self, name: str) -> None:
         with self.lock:
@@ -182,7 +263,12 @@ class FakeNessie:
         metadata_location: str | None = None,
         snapshot_id: int = 1,
         content_id: str | None = None,
+        *,
+        commit_message: str | None = None,
+        commit_time: float | None = None,
     ) -> dict[str, Any]:
+        """Put a table on `ref`. Also records a commit touching it in the ref's log
+        (without moving the head, so existing head hashes stay put)."""
         if isinstance(elements, str):
             elements = tuple(elements.split("."))
         elements = tuple(elements)
@@ -205,6 +291,15 @@ class FakeNessie:
             if ref not in self.state.branches:
                 self.set_branch(ref)
             self.state.tables.setdefault(ref, {})[elements] = content
+            self._record_commit(
+                ref,
+                secrets.token_hex(16),
+                commit_message or f"Update table {'.'.join(elements)}",
+                "fake-author",
+                (elements,),
+                (),
+                commit_time,
+            )
         return content
 
     def remove_table(self, ref: str, elements: tuple[str, ...] | str) -> None:
@@ -413,6 +508,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"reference": reference})
         elif len(segments) == 3 and segments[2] == "entries":
             self._handle_entries(ref, reference, query)
+        elif len(segments) == 3 and segments[2] == "history":
+            self._handle_history(ref, query)
         elif len(segments) == 4 and segments[2] == "contents":
             elements = decode_key(segments[3])
             with fake.lock:
@@ -471,4 +568,36 @@ class _Handler(BaseHTTPRequestHandler):
                 "effectiveReference": reference,
                 "hasMore": has_more,
             },
+        )
+
+    def _handle_history(self, ref: str, query: dict[str, list[str]]) -> None:
+        fake = self.owner
+        fetch_all = query.get("fetch", [""])[0].upper() == "ALL"
+        with fake.lock:
+            if fetch_all and fake.state.reject_fetch_all:
+                reject = True
+            else:
+                reject = False
+                entries = [json.loads(json.dumps(e)) for e in fake.state.commits.get(ref, [])]
+                omit = fake.state.omit_operations
+                page_size = fake.state.history_page_size
+        if reject:
+            self._send_json(
+                400, _nessie_error(400, "Bad Request", "fetch option not supported", "BAD_REQUEST")
+            )
+            return
+        entries.reverse()  # newest first
+        for entry in entries:
+            if not fetch_all or omit:
+                entry.pop("operations", None)
+        if "max-records" in query:
+            requested = int(query["max-records"][0])
+            page_size = requested if page_size is None else min(page_size, requested)
+        start = int(query["page-token"][0]) if "page-token" in query else 0
+        end = len(entries) if page_size is None else start + page_size
+        has_more = end < len(entries)
+        self._send_json(
+            200,
+            {"logEntries": entries[start:end], "hasMore": has_more,
+             "token": str(end) if has_more else None},
         )

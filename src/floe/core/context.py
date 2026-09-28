@@ -55,16 +55,18 @@ from floe.core.errors import (
     DisallowedFunction,
     ExtensionUnavailable,
     FloeError,
+    MetadataReadError,
     MissingDataSourceColumn,
     QueryCancelled,
     QueryError,
     ReadOnlyViolation,
     TableNotFound,
     TenantScopeError,
+    TimelineUnavailable,
     ViewNameCollision,
 )
 from floe.core.extensions import bundled_extension_dir
-from floe.core.nessie import NessieClient, TableKey, container_of
+from floe.core.nessie import NessieClient, TableKey, container_of, metadata_file_name
 from floe.core.profiles import Profile
 
 log = logging.getLogger("floe.context")
@@ -1556,6 +1558,98 @@ class FloeSession:
         with self._activity(ref, token):
             columns, _ = self._with_rebuild(ref, run)
         return columns
+
+    # ----- table metadata (Timeline, SPEC §15.7) ----------------------------
+    def with_table_metadata(
+        self,
+        ref: str,
+        key: TableKey | str,
+        load: Callable[[str, Callable[[], bytes]], T],
+        *,
+        cancel_token: CancelToken | None = None,
+    ) -> tuple[TableInfo, T]:
+        """Resolve `key`'s current metadata.json on `ref` and hand it to `load`.
+
+        Resolution is exactly view registration's (SPEC §6.3): the key's catalog entry
+        (shared namespaces from the main ref), its Nessie pointer (`TableNotFound`,
+        `CorruptPointer`) and the container check (`TenantScopeError`). Then
+        `load(location, read)` runs, where `read()` returns the raw bytes of that one
+        metadata.json, read through DuckDB on a cursor of the ref's restricted connection
+        (same `allowed_directories`, no connection lock needed). `location` is an opaque
+        cache key for `load`; it must never leave the core layer. Only files named
+        `*.metadata.json` are ever read — never manifests or data files. A metadata.json
+        that disappeared (catalog rebuilt) is retried once on a fresh connection.
+        """
+        if self.is_local or self._nessie is None:
+            raise TimelineUnavailable()
+        table_key = TableKey.parse(key) if isinstance(key, str) else key
+        token = cancel_token if cancel_token is not None else CancelToken()
+        nessie = self._nessie
+
+        def run(ctx: Context) -> tuple[TableInfo, T]:
+            self._ensure_catalog(ctx)
+            info = self._info_for_key(ctx, table_key)
+            if self.is_tenant_ref(ctx.ref):
+                self._load_registry(ctx, token)
+            token.raise_if_cancelled()
+            location = nessie.pointer(info.source_ref, info.key).metadata_location
+            container = container_of(location, local_root=self._local_storage_root)
+            self._check_container(ctx.ref, info, container, shared=info.shared)
+            if ctx.allowed_containers is not None and container not in ctx.allowed_containers:
+                raise _ScopeChanged(f"Container mapping for {ctx.ref} changed")
+            return info, load(
+                location, lambda: self._read_metadata_file(ctx, info, location, token)
+            )
+
+        with self._activity(ref, token):
+            result, _ = self._with_rebuild(ref, run)
+        return result
+
+    def _read_metadata_file(
+        self, ctx: Context, info: TableInfo, location: str, token: CancelToken
+    ) -> bytes:
+        """Bytes of one `*.metadata.json` via `read_blob` on a cursor of `ctx`'s connection.
+
+        The cursor shares the connection's database config, so the file-access
+        restriction (`allowed_directories`, locked) applies. Errors never carry the path.
+        """
+        name = metadata_file_name(location)
+        if not name.endswith(".metadata.json") or any(ch in location for ch in "*?[]{}"):
+            raise MetadataReadError(info.dotted, "not a metadata.json file")
+        cursor = ctx.connection.cursor()
+        reader = Context(ctx.key, cursor)  # so a cancel interrupts this cursor only
+        try:
+            with token.statement(reader):
+                rows = cursor.execute(
+                    "SELECT content FROM read_blob(?)", [location]
+                ).fetchall()
+        except duckdb.InterruptException:
+            raise QueryCancelled() from None
+        except duckdb.PermissionException:
+            raise MetadataReadError(info.dotted, "access denied") from None
+        except duckdb.Error as exc:
+            if is_missing_metadata_error(exc):
+                raise _MetadataGone(
+                    f"The metadata of {info.dotted} no longer exists (catalog changed)."
+                ) from None
+            if not self.is_local and is_storage_auth_error(exc):
+                raise AdlsAuthError(self._profile.adls_account, self._profile.adls_auth) from None
+            raise MetadataReadError(info.dotted, type(exc).__name__) from None
+        finally:
+            try:
+                cursor.close()
+            except duckdb.Error:  # pragma: no cover
+                pass
+        token.raise_if_cancelled()
+        if not rows:
+            raise _MetadataGone(
+                f"The metadata of {info.dotted} no longer exists (catalog changed)."
+            )
+        if len(rows) != 1:
+            raise MetadataReadError(info.dotted, "ambiguous location")
+        content = rows[0][0]
+        log.info("Read metadata of %s @ %s (%d bytes)", info.dotted, info.source_ref, len(content))
+        return bytes(content)
 
     # ----- heads / refresh -------------------------------------------------
     def current_head(self, ref: str) -> str | None:

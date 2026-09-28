@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from floe.core import diagnostics
+from floe.core.ask import AskUnavailable
 from floe.core.errors import (
     CorruptPointer,
     FloeError,
@@ -123,4 +124,6 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
         payload["ref"] = exc.ref
     if isinstance(exc, NessieUnreachable):
         payload["unreachable"] = True
+    if isinstance(exc, AskUnavailable) and exc.attempts:
+        payload["attempts"] = [{"model": m, "outcome": o} for m, o in exc.attempts]
     return payload

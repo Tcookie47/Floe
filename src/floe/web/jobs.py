@@ -170,7 +170,7 @@ class JobManager:
             job.seq = next(self._seq)
             self._jobs[job.id] = job
         for old in superseded:
-            log.debug("Cancelling superseded %s job in channel %s", old.kind, channel)
+            log.debug("Cancelling superseded %s job in channel %r", old.kind, channel)
             self.cancel(old.id)
         self._pool.submit(self._run, job, fn, on_success)
         return job
@@ -207,7 +207,7 @@ class JobManager:
         except Exception as exc:  # noqa: BLE001 - reported through the job, never re-raised
             if not isinstance(exc, FloeError):
                 log.error(
-                    "%s job failed: %s",
+                    "%s job failed: %r",
                     job.kind,
                     diagnostics.redact(f"{type(exc).__name__}: {exc}"),
                 )

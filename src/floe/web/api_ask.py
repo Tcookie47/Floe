@@ -28,10 +28,9 @@ router = APIRouter(prefix="/api/ask")
 
 MAX_QUESTION = 4_000
 MAX_EDITOR_SQL = 100_000
-MAX_MODEL = 200
 MAX_BASE_URL = 500
 MAX_TIMEOUT_S = 600
-SETTINGS_KEYS = {"enabled", "model", "base_url", "timeout_s", "api_key"}
+SETTINGS_KEYS = {"enabled", "base_url", "timeout_s", "api_key"}
 
 
 def _bad(message: str) -> ApiError:
@@ -66,11 +65,6 @@ def put_settings(payload: JsonBody) -> dict[str, Any]:
         if not isinstance(payload["enabled"], bool):
             raise _bad("enabled must be true or false.")
         current["enabled"] = payload["enabled"]
-    if "model" in payload:
-        model = payload["model"]
-        if not isinstance(model, str) or len(model) > MAX_MODEL:
-            raise _bad("model must be a string.")
-        current["model"] = model.strip()
     if "base_url" in payload:
         url = payload["base_url"]
         if not isinstance(url, str) or len(url) > MAX_BASE_URL:
@@ -167,7 +161,7 @@ def preview(
         session, ref, question, selected, editor_sql, tenant_filter, CancelToken()
     )
     return {
-        "body": ask.preview_request(messages, ask.load_settings()),
+        "body": ask.preview_request(messages),
         "focus_views": focus,
     }
 
@@ -203,6 +197,8 @@ def start_ask(
             "model": result.model,
             "elapsed_ms": result.elapsed_ms,
             "focus_views": focus,
+            "fell_back": result.fell_back,
+            "attempts": [{"model": m, "outcome": o} for m, o in result.attempts],
         }
 
     return state.jobs.submit("ask", run, profile=name, channel=channel, meta={"ref": ref})

@@ -226,3 +226,29 @@ class ViewNameCollision(FloeError):
             f"{self.view_name!r}; Floe refuses to register any of them to avoid "
             "showing the wrong table."
         )
+
+
+class TimelineUnavailable(FloeError):
+    """The Timeline (snapshots / commit log) needs a Nessie catalog (not local mode)."""
+
+    def __init__(self, reason: str = "local mode") -> None:
+        self.reason = reason
+        super().__init__(f"Timeline unavailable: {reason}")
+
+    def user_message(self) -> str:
+        return (
+            "The Timeline needs a Nessie catalog. Local mode reads plain parquet files, "
+            "which have no snapshots or commit history."
+        )
+
+
+class MetadataReadError(FloeError):
+    """A table's metadata.json could not be read or parsed. Carries no path."""
+
+    def __init__(self, key: str, reason: str) -> None:
+        self.key = key
+        self.reason = reason
+        super().__init__(f"Could not read the metadata of {key}: {reason}")
+
+    def user_message(self) -> str:
+        return f"Could not read the table metadata of {self.key} ({self.reason})."

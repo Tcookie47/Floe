@@ -4,7 +4,8 @@ Catalog endpoints (branches / tables / head / refresh) are sync FastAPI endpoint
 they run in the server's worker threads, never on the event loop; the first one for a
 profile builds its `FloeSession` (and reads its keyring secrets) there.
 
-Preview / schema / query / test-connection / ask work runs as jobs (`floe.web.jobs`):
+Preview / schema / query / test-connection / ask / Timeline (freshness, history,
+table_history) work runs as jobs (`floe.web.jobs`):
 `POST /api/jobs` returns an id at once, the browser polls `GET /api/jobs/{id}` and can
 `POST /api/jobs/{id}/cancel`. Result rows are served a page at a time from memory.
 """
@@ -23,7 +24,7 @@ from floe import __commit__, __version__
 from floe.core import diagnostics
 from floe.core.context import ColumnInfo, FloeSession, QueryResult, TableInfo
 from floe.core.export import ExportNotAllowed
-from floe.web import api_ask, api_profiles
+from floe.web import api_ask, api_profiles, api_timeline
 from floe.web.jobs import CANCELLED, DONE, ERROR, Job, JobNotFound
 from floe.web.prefs import PrefsError
 from floe.web.serialize import error_payload, frame_columns, frame_rows
@@ -45,6 +46,7 @@ DEFAULT_CHANNELS = {
     "query": "sql",
     "test_connection": "test_connection",
     "ask": "ask",
+    **api_timeline.CHANNELS,
 }
 
 
@@ -191,6 +193,8 @@ def _start_job(state: WebState, payload: dict[str, Any]) -> Job:
     if profile is None:
         raise ApiError(404, "ProfileNotFound", f"No such profile: {name}")
     ref = _ref(payload.get("ref"))
+    if kind in api_timeline.KINDS:
+        return api_timeline.start_job(state, name, kind, ref, payload, channel)
     tenant_filter = _bool(payload, "tenant_filter", True)
     sessions = state.sessions
     meta: dict[str, Any] = {"ref": ref, "tenant_filter": tenant_filter}
@@ -277,14 +281,17 @@ def job_payload(job: Job, offset: int = 0, limit: int = DEFAULT_PAGE) -> dict[st
         "elapsed": round(job.elapsed, 3),
         "cancel_requested": job.cancel_requested,
         **{k: v for k, v in job.meta.items() if k in ("ref", "view_name", "tenant_filter",
-                                                        "row_limit")},
+                                                        "row_limit", "key")},
     }
     if job.kind == "test_connection":
         out["steps"] = list(job.progress)
     if job.status == DONE:
         out["result"] = _result_payload(job, offset, limit)
     elif job.status == ERROR and job.error is not None:
-        out["error"] = error_payload(job.error)
+        if job.kind in api_timeline.KINDS:
+            out["error"] = api_timeline.error_for(job)
+        else:
+            out["error"] = error_payload(job.error)
     elif job.status == CANCELLED:
         out["message"] = "Cancelled."
     return out

@@ -17,6 +17,13 @@ API_KEY = "sk-or-synthetic-KEY-0123456789"
 ROW_SENTINELS = ("C001", "C003", "alpha", "o'delta", "synthetic-a", "10.5", "wh-synthetic")
 
 
+@pytest.fixture(autouse=True)
+def _clean_model_chain_cache():
+    ask._model_chain_mem_cache.clear()
+    yield
+    ask._model_chain_mem_cache.clear()
+
+
 class FakeResponse:
     def __init__(self, status: int, body: bytes) -> None:
         self.status = status
@@ -33,11 +40,21 @@ class FakeResponse:
 
 
 class FakeOpener:
+    """A fake OpenRouter chat-completions + models endpoint. `GET .../models` calls (the
+    dynamic fallback-slot fetch) are recorded separately and, with no models configured,
+    return an empty list, so the fallback chain stays at its 4 fixed models."""
+
     def __init__(self, content: str) -> None:
         self.content = content
         self.requests: list = []
+        self.model_requests: list = []
 
     def open(self, req, timeout=None):
+        if req.get_method() == "GET":
+            self.model_requests.append(req)
+            import urllib.error
+
+            raise urllib.error.HTTPError(req.full_url, 404, "no models endpoint", {}, None)
         self.requests.append(req)
         body = {"model": "fake/model", "choices": [{"message": {"content": self.content}}]}
         return FakeResponse(200, json.dumps(body).encode())
@@ -65,7 +82,7 @@ def spy_factory(query_calls):
 
 
 def configure(client, **overrides):
-    body = {"enabled": True, "model": "fake/model", "api_key": API_KEY, **overrides}
+    body = {"enabled": True, "api_key": API_KEY, **overrides}
     r = client.put("/api/ask/settings", json=body)
     assert r.status_code == 200, r.text
     return r.json()
@@ -79,20 +96,22 @@ def test_settings_api_key_is_write_only(client):
     assert got["timeout_s"] == 30 and got["base_url"] == "https://example.invalid/api/v1"
     assert keyring.get_password(ask.KEYRING_SERVICE, ask.KEYRING_USERNAME) == API_KEY
     # Omitted key = unchanged; "" clears.
-    assert client.put("/api/ask/settings", json={"model": "m2"}).json()["api_key"]["saved"]
+    assert client.put("/api/ask/settings", json={"timeout_s": 45}).json()["api_key"]["saved"]
     assert client.put("/api/ask/settings", json={"api_key": ""}).json()["api_key"] == {
         "saved": False
     }
+    # There is no model field any more: the server rejects one as an unknown setting.
     for bad in (
         {"enabled": "yes"},
         {"timeout_s": 0},
         {"base_url": "file:///etc/passwd"},
         {"base_url": "http://example.invalid/api/v1"},  # the API key would go in clear
         {"base_url": "http://127.0.0.1.example.invalid/v1"},
-        {"model": 5},
+        {"model": "anything"},
         {"bogus": 1},
     ):
         assert client.put("/api/ask/settings", json=bad).status_code == 400, bad
+    assert "model" not in configure(client)
     for body in client.bodies:
         assert API_KEY not in body
     assert API_KEY not in ask.settings_path().read_text()
@@ -136,7 +155,7 @@ def test_preview_body_has_schema_but_no_rows(make_client, store, fx, spy_factory
     assert r.status_code == 200, r.text
     body = r.json()["body"]
     sent = json.loads(body)
-    assert sent["model"] == "fake/model"
+    assert sent["model"] == ask.MODEL_CHAIN[0]  # the preview always shows the first model
     assert r.json()["focus_views"] == ["bronze_medical", "gold_summary", "gold_ref_codes"]
     user = sent["messages"][1]["content"]
     assert "gold_summary" in user and "amount" in user and "label" in user
@@ -168,6 +187,9 @@ def test_ask_job_returns_sql_and_never_executes_it(
     assert job["result"]["sql"] == "SELECT code, sum(amount) FROM gold_summary GROUP BY code"
     assert job["result"]["warnings"] == []
     assert job["result"]["focus_views"] == ["gold_summary"]
+    assert job["result"]["model"] == "fake/model"  # from the fake reply's top-level "model"
+    assert job["result"]["fell_back"] is False
+    assert job["result"]["attempts"] == [{"model": ask.MODEL_CHAIN[0], "outcome": "ok"}]
     assert query_calls == []  # generated SQL is never executed
 
     (req,) = opener.requests

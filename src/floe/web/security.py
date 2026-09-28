@@ -4,11 +4,23 @@ Order of checks for every request:
 
 1. `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (DNS-rebinding defence) → 400.
 2. A declared `Content-Length` over `MAX_BODY_BYTES` → 413.
-3. `GET /?token=<t>`: the launch token is **single-use** and expires `token_ttl` seconds
-   after launch. The first constant-time match sets the HttpOnly, SameSite=Strict session
+3. `/_control/...` (used by `floe show` / `floe stop`, never by a browser): any request
+   carrying `Origin` or `Sec-Fetch-*` headers (i.e. browser-originated) → 403; a missing
+   or wrong `X-Floe-Control` key (constant-time compare against the per-process control
+   key from the state file) → 401. Exception: `GET /_control/health?nonce=<urlsafe>`
+   without any key is let through; the route then answers with an HMAC proof of the
+   key (never the key), so the CLI can authenticate the server first. These routes skip
+   the cookie / API-key checks below, but nothing above. Without a control key the
+   routes don't exist (404). Request paths are never logged verbatim (a fixed route
+   label is logged instead), so a crafted path can't inject log lines.
+4. `GET /?token=<t>`: launch tokens are **single-use** and expire `token_ttl` seconds
+   after they were minted (the startup token, plus any minted later by
+   `POST /_control/login-link`; at most `MAX_OUTSTANDING_TOKENS` are outstanding, the
+   oldest is dropped first). A constant-time match sets the HttpOnly, SameSite=Strict session
    cookie and returns a tiny 200 "signed in" page whose `<meta http-equiv="refresh">`
    moves on to `/#k=<api key>` (stripping the token from the URL); any later, expired or
-   wrong token → 401 "open Floe from the terminal link" page.
+   wrong token → 401 "open Floe from the terminal link" page. The cookie and the API key
+   are the same for every link the process issues, so tabs opened earlier keep working.
 
    Why not a 303 straight to `/`: `floe serve` opens a private `file://` launch page that
    meta-refreshes to the token URL, so that navigation chain is *cross-site*. Chromium
@@ -21,21 +33,21 @@ Order of checks for every request:
    top-level GET navigation carry the cookie) and needs no script, so the CSP stays
    `default-src 'self'` with no inline scripts. The page is sent with `no-store` and
    `no-referrer` (as every response is), so the key in it isn't cached or leaked.
-4. State-changing methods (anything but GET/HEAD/OPTIONS) need an `Origin` (or, failing
+5. State-changing methods (anything but GET/HEAD/OPTIONS) need an `Origin` (or, failing
    that, a `Referer`) of `http://127.0.0.1:<port>` / `http://localhost:<port>` → else 403.
-5. Every other request needs the session cookie → 401 JSON for `/api/...`, else a small
+6. Every other request needs the session cookie → 401 JSON for `/api/...`, else a small
    "open Floe from the link printed in the terminal" page.
-6. `/api/...` additionally needs the per-launch API key in the `X-Floe-Auth` header → 401.
+7. `/api/...` additionally needs the per-launch API key in the `X-Floe-Auth` header → 401.
    Browsers don't isolate cookies by port, so any other server on 127.0.0.1 the browser
    talks to receives the session cookie; the API key is what such a server can't obtain.
    It reaches the page only in the sign-in page's refresh URL fragment (never sent over the network
    again); `app.js` moves it to `sessionStorage`, which *is* isolated per origin
    including the port. (A "fetch the key" endpoint guarded by cookie + `Sec-Fetch-Site`
    was rejected: a non-browser client holding a leaked cookie can forge those headers.)
-7. Request bodies are buffered up to `MAX_BODY_BYTES` (also for chunked uploads) → 413.
+8. Request bodies are buffered up to `MAX_BODY_BYTES` (also for chunked uploads) → 413.
 
 Every response gets a strict CSP, `nosniff`, `no-referrer` and `Cache-Control: no-store`.
-Neither the token, the API key nor the cookie value is ever logged.
+Neither a token, the API key, the control key nor the cookie value is ever logged.
 """
 
 from __future__ import annotations
@@ -45,11 +57,15 @@ import html
 import json
 import logging
 import secrets
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
 from http.cookies import SimpleCookie
 from typing import Any
+
+from floe.core import diagnostics
+from floe.instance import NONCE_RE  # keyless health-check nonce (instance.verify)
 
 log = logging.getLogger("floe.web.security")
 
@@ -57,15 +73,23 @@ COOKIE_NAME = "floe_session"
 CSP = "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 API_KEY_HEADER = "x-floe-auth"
+CONTROL_HEADER = "x-floe-control"
+CONTROL_PREFIX = "/_control/"
+# Headers only browsers send: their presence marks a request as browser-originated.
+BROWSER_HEADERS = ("origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+                   "sec-fetch-user")
+CONTROL_ROUTES = ("health", "login-link", "shutdown")
 MAX_BODY_BYTES = 2 * 1024 * 1024
 DEFAULT_TOKEN_TTL = 120.0
+MAX_OUTSTANDING_TOKENS = 5
 
 UNAUTHORIZED_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Floe</title></head>
 <body><h1>Floe</h1>
 <p>Open Floe from the link printed in the terminal where you ran <code>floe serve</code>.</p>
-<p>That link works once, within two minutes of starting Floe. If it was already used
-(or has expired), stop Floe with Ctrl+C and run <code>floe serve</code> again.</p>
+<p>That link works once, within two minutes. If it was already used (or has expired),
+run <code>floe show --open</code> (or <code>floe show</code> and paste the new link) in a
+terminal while Floe is running.</p>
 <p>If the address bar shows <code>#k=</code> after the address, the link was accepted but
 your browser didn't send Floe's sign-in cookie. Click the address bar and press Enter to
 retry. If that doesn't help, restart with <code>floe serve --no-browser</code> and paste
@@ -94,10 +118,97 @@ def _security_headers() -> list[tuple[bytes, bytes]]:
     ]
 
 
+def _control_route(path: str) -> str:
+    """A fixed label for a control route (request paths are never logged verbatim)."""
+    return {f"{CONTROL_PREFIX}{name}": name for name in CONTROL_ROUTES}.get(path, "(other)")
+
+
+class LaunchTokens:
+    """The outstanding single-use launch tokens of this process. Each expires `ttl`
+    seconds after it was minted; at most `max_outstanding` exist (the oldest is dropped).
+    `on_done` callbacks (e.g. deleting a launch file) run when a token is used, expires
+    or is dropped. Thread-safe: tokens are minted from worker threads and redeemed on
+    the event loop."""
+
+    def __init__(
+        self,
+        ttl: float = DEFAULT_TOKEN_TTL,
+        max_outstanding: int = MAX_OUTSTANDING_TOKENS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.ttl = ttl
+        self.max_outstanding = max_outstanding
+        self._clock = clock
+        self._lock = threading.Lock()
+        # token -> (deadline, on_done); insertion order is minting order.
+        self._tokens: dict[str, tuple[float, Callable[[], None] | None]] = {}
+
+    @staticmethod
+    def _done(callbacks: list[Callable[[], None] | None]) -> None:
+        for callback in callbacks:
+            if callback is None:
+                continue
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - cleanup must not break sign-in
+                log.warning("Launch-link cleanup failed")
+
+    def _prune_locked(self) -> list[Callable[[], None] | None]:
+        now = self._clock()
+        expired = [t for t, (deadline, _) in self._tokens.items() if now > deadline]
+        return [self._tokens.pop(t)[1] for t in expired]
+
+    def add(self, token: str, on_done: Callable[[], None] | None = None) -> None:
+        if not token:
+            raise ValueError("a non-empty token is required")
+        diagnostics.register_secret(token)
+        with self._lock:
+            done = self._prune_locked()
+            while len(self._tokens) >= self.max_outstanding:
+                oldest = next(iter(self._tokens))
+                done.append(self._tokens.pop(oldest)[1])
+            self._tokens[token] = (self._clock() + self.ttl, on_done)
+        self._done(done)
+
+    def mint(self, on_done: Callable[[], None] | None = None) -> str:
+        token = secrets.token_urlsafe(32)
+        self.add(token, on_done)
+        return token
+
+    def redeem(self, given: str) -> bool:
+        """True (once) if `given` is an outstanding, unexpired token; it is then spent."""
+        given_bytes = given.encode("utf-8", "replace")
+        with self._lock:
+            done = self._prune_locked()
+            match = None
+            for token in list(self._tokens):  # compare against all: no early exit
+                if hmac.compare_digest(given_bytes, token.encode()):
+                    match = token
+            if match is not None:
+                done.append(self._tokens.pop(match)[1])
+        self._done(done)
+        return match is not None
+
+    def outstanding(self) -> int:
+        with self._lock:
+            done = self._prune_locked()
+            count = len(self._tokens)
+        self._done(done)
+        return count
+
+    def clear(self) -> None:
+        with self._lock:
+            done = [on_done for _, on_done in self._tokens.values()]
+            self._tokens.clear()
+        self._done(done)
+
+
 class SecurityMiddleware:
-    """See the module docstring. `token` is the per-launch launch token from `floe serve`;
-    `api_key` the per-launch API key (random if not given); `on_token_used` is called once
-    when the launch token has been exchanged (e.g. to delete the browser launch file)."""
+    """See the module docstring. `token` is the startup launch token from `floe serve`
+    (added to `tokens`, a `LaunchTokens`, created if not given); `api_key` the per-launch
+    API key (random if not given); `on_token_used` is called once when the startup token
+    has been used or has expired (e.g. to delete the browser launch file);
+    `control_key` enables the `/_control/...` routes."""
 
     def __init__(
         self,
@@ -109,14 +220,15 @@ class SecurityMiddleware:
         token_ttl: float = DEFAULT_TOKEN_TTL,
         on_token_used: Callable[[], None] | None = None,
         max_body: int = MAX_BODY_BYTES,
+        tokens: LaunchTokens | None = None,
+        control_key: str | None = None,
     ) -> None:
         if not token:
             raise ValueError("a non-empty token is required")
         self.app = app
-        self._token = token.encode()
-        self._token_used = False
-        self._token_deadline = time.monotonic() + token_ttl
-        self._on_token_used = on_token_used
+        self.tokens = tokens if tokens is not None else LaunchTokens(token_ttl)
+        self.tokens.add(token, on_token_used)
+        self._control_key = control_key.encode() if control_key else None
         self._cookie_value = secrets.token_urlsafe(32)
         self._api_key = api_key or secrets.token_urlsafe(32)
         self._max_body = max_body
@@ -124,6 +236,14 @@ class SecurityMiddleware:
         self._origins = {f"http://{h}" for h in self._hosts}
 
     # ----- helpers -------------------------------------------------------------
+    @staticmethod
+    def _is_health_challenge(path: str, method: str, scope: dict[str, Any]) -> bool:
+        if path != f"{CONTROL_PREFIX}health" or method != "GET":
+            return False
+        query = urllib.parse.parse_qs(scope.get("query_string", b"").decode("latin-1"))
+        nonces = query.get("nonce", [])
+        return len(nonces) == 1 and NONCE_RE.fullmatch(nonces[0]) is not None
+
     @staticmethod
     def _headers(scope: dict[str, Any]) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -181,9 +301,9 @@ class SecurityMiddleware:
         await send({"type": "http.response.body", "body": body})
 
     async def _reject(self, send: Any, status: int, path: str, message: str) -> None:
-        if path.startswith("/api/") or path == "/api":
+        if path.startswith(("/api/", CONTROL_PREFIX)) or path == "/api":
             type_name = {
-                400: "BadHost", 401: "Unauthorized", 413: "RequestTooLarge"
+                400: "BadHost", 401: "Unauthorized", 404: "NotFound", 413: "RequestTooLarge"
             }.get(status, "Forbidden")
             body = json.dumps({"error": {"type": type_name, "message": message}}).encode()
             await self._send(send, status, body, b"application/json")
@@ -240,24 +360,40 @@ class SecurityMiddleware:
             await self._reject(send, 413, path, "Request body too large.")
             return
 
+        if path.startswith(CONTROL_PREFIX):
+            if self._control_key is None:
+                await self._reject(send, 404, path, "Not found.")
+                return
+            route = _control_route(path)
+            if any(name in headers for name in BROWSER_HEADERS):
+                log.warning("Rejected a browser request to control route %s", route)
+                await self._reject(send, 403, path, "Control requests from a browser are refused.")
+                return
+            if CONTROL_HEADER not in headers and self._is_health_challenge(path, method, scope):
+                # Keyless health check with a nonce: the route answers with an HMAC proof
+                # of the control key, so the CLI can check this server before it sends
+                # the key (see floe.instance.verify).
+                await self.app(scope, receive, send)
+                return
+            given_key = headers.get(CONTROL_HEADER, "").encode("latin-1")
+            if not hmac.compare_digest(given_key, self._control_key):
+                log.warning("Rejected a control request to %s with a missing or wrong key", route)
+                await self._reject(send, 401, path, "Missing or wrong control key.")
+                return
+            receive = await self._buffer_body(receive)
+            if receive is None:
+                await self._reject(send, 413, path, "Request body too large.")
+                return
+            await self.app(scope, receive, send)
+            return
+
         query = urllib.parse.parse_qs(scope.get("query_string", b"").decode("latin-1"))
         if path == "/" and method == "GET" and "token" in query:
-            given = query["token"][0].encode()
-            if not hmac.compare_digest(given, self._token):
-                log.warning("Rejected a launch link with a wrong token")
-                await self._reject(send, 401, path, "Invalid token.")
+            # Single use: redeem() checks and spends the token atomically.
+            if not self.tokens.redeem(query["token"][0]):
+                log.warning("Rejected a launch link that is wrong, already used or expired")
+                await self._reject(send, 401, path, "Invalid, used or expired launch link.")
                 return
-            if self._token_used or time.monotonic() > self._token_deadline:
-                log.warning("Rejected a launch link that was already used or has expired")
-                await self._reject(send, 401, path, "The launch link was already used.")
-                return
-            # Single use: no await between the check above and this assignment.
-            self._token_used = True
-            if self._on_token_used is not None:
-                try:
-                    self._on_token_used()
-                except Exception:  # noqa: BLE001 - cleanup must not block sign-in
-                    log.warning("Launch-link cleanup failed")
             cookie = (
                 f"{COOKIE_NAME}={self._cookie_value}; HttpOnly; SameSite=Strict; Path=/"
             ).encode()
@@ -272,7 +408,7 @@ class SecurityMiddleware:
             return
 
         if method not in SAFE_METHODS and not self._origin_ok(headers):
-            log.warning("Rejected a %s request with a missing or foreign Origin", method)
+            log.warning("Rejected a %r request with a missing or foreign Origin", method[:16])
             await self._reject(send, 403, path, "Cross-origin request refused.")
             return
 

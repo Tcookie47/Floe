@@ -169,6 +169,60 @@ def build_fixtures(base_dir: str | Path) -> IcebergFixtures:
     return fx
 
 
+HISTORY_REF = "eg-test1"
+HISTORY_KEY = "silver.input_layer.events"
+
+
+@dataclass
+class HistoryTable:
+    """A table with several snapshots: append 3, append 2, overwrite with 4.
+
+    pyiceberg writes the overwrite as a `delete` snapshot followed by an `append`, so the
+    operations are append, append, delete, append and the totals 3, 5, 0, 4."""
+
+    location: str
+    snapshot_ids: list[int]
+    table_dir: Path
+    key: str = HISTORY_KEY
+
+
+def build_history_table(
+    iceberg_root: str | Path, container: str = "eg-test1", key: str = HISTORY_KEY
+) -> HistoryTable:
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    iceberg_root = Path(iceberg_root)
+    iceberg_root.mkdir(parents=True, exist_ok=True)
+    cat = SqlCatalog(
+        "fx_history",
+        uri=f"sqlite:///{iceberg_root.parent / f'catalog-history-{container}.db'}",
+        warehouse=fixture_location(iceberg_root / "_warehouse"),
+    )
+    elements = key.split(".")
+    cat.create_namespace_if_not_exists(tuple(elements[:-1]))
+    table_dir = iceberg_root / container / Path(*elements)
+
+    def rows(ids: list[int]) -> pa.Table:
+        return pa.table(
+            {
+                "id": pa.array(ids, pa.int64()),
+                "data_source": pa.array([container] * len(ids), pa.string()),
+            }
+        )
+
+    table = cat.create_table(key, schema=rows([1]).schema, location=fixture_location(table_dir))
+    table.append(rows([1, 2, 3]))
+    table = cat.load_table(key)
+    table.append(rows([4, 5]))
+    table = cat.load_table(key)
+    table.overwrite(rows([6, 7, 8, 9]))
+    table = cat.load_table(key)
+    ids = [s.snapshot_id for s in table.metadata.snapshots]
+    return HistoryTable(
+        location=table.metadata_location, snapshot_ids=ids, table_dir=table_dir, key=key
+    )
+
+
 def seed_fake_nessie(fake, fixtures: IcebergFixtures, main_ref: str = MAIN_REF) -> None:
     """Create branches main / eg-test1 / eg-test2 / eg-test3 and add every fixture table."""
     fake.set_branch(main_ref)
