@@ -1,0 +1,58 @@
+name: release-web
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -e ".[dev]"
+      - run: ruff check
+      # Browser e2e tests need a Chromium install; skip them here to keep the
+      # release fast (they run in ci.yml's dedicated e2e job on every push).
+      - run: pytest -m "not e2e"
+      - run: python scripts/write_build_info.py "${{ github.ref_name }}" "${GITHUB_SHA::7}"
+      - run: python -m build
+      - name: Verify wheel contents
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          echo "Inspecting $wheel"
+          for path in \
+            "floe/web/templates/index.html" \
+            "floe/web/static/vendor/codemirror/view.js" \
+            "floe/_build_info.py"; do
+            if ! unzip -l "$wheel" | grep -q "$path"; then
+              echo "missing $path from $wheel" >&2
+              exit 1
+            fi
+          done
+      - name: Smoke-test the wheel in a fresh venv
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/floe-smoke
+          /tmp/floe-smoke/bin/pip install dist/*.whl
+          version_out=$(/tmp/floe-smoke/bin/floe --version)
+          echo "$version_out"
+          tag_version="${GITHUB_REF_NAME#v}"
+          case "$version_out" in
+            *"$tag_version"*) ;;
+            *) echo "expected version $tag_version in '$version_out'" >&2; exit 1 ;;
+          esac
+          /tmp/floe-smoke/bin/python -c "import floe.web.app"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: true

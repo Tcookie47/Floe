@@ -1,0 +1,36 @@
+name: release
+
+on:
+  push:
+    tags: ["desktop-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev-desktop]" pyinstaller
+      - run: pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - run: python scripts/write_build_info.py "${{ github.ref_name }}" "${GITHUB_SHA::7}"
+      - run: python scripts/fetch_duckdb_extensions.py packaging/duckdb_extensions
+      - run: pyinstaller packaging/Floe.spec
+      - run: codesign --force --deep -s - dist/Floe.app
+      - run: ditto -c -k --keepParent dist/Floe.app "Floe-${{ github.ref_name }}-arm64.zip"
+      - name: Smoke-test the bundle
+        run: |
+          test -d dist/Floe.app
+          bundle_id=$(/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" dist/Floe.app/Contents/Info.plist)
+          echo "CFBundleIdentifier: $bundle_id"
+          test "$bundle_id" = "com.tcookie.floe"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: Floe-*.zip
+          generate_release_notes: true

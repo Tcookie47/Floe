@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -e ".[dev]"
+      - run: ruff check
+      - run: pytest -m "not e2e"
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -e ".[dev]"
+      - run: playwright install --with-deps chromium
+      - run: pytest -m e2e
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -e ".[dev]"
+      - run: python scripts/write_build_info.py "0.0.0.dev0" "${GITHUB_SHA::7}"
+      - run: python -m build
+      - name: Verify wheel contains web assets
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          for path in \
+            "floe/web/templates/index.html" \
+            "floe/web/static/vendor/codemirror/view.js" \
+            "floe/_build_info.py"; do
+            if ! unzip -l "$wheel" | grep -q "$path"; then
+              echo "missing $path from $wheel" >&2
+              exit 1
+            fi
+          done
+
+  desktop:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -e ".[dev-desktop]"
+      - run: ruff check
+      - run: pytest -m "not e2e"
+        env:
+          QT_QPA_PLATFORM: offscreen

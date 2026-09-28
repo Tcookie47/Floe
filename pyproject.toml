@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "floe"
+dynamic = ["version"]
+description = "Personal Mac desktop app for browsing and querying Iceberg tables via Nessie and DuckDB."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+    # Pinned to match the duckdb-extension-* wheels' cached extensions in
+    # ~/.duckdb/extensions (this sandbox can't reach extensions.duckdb.org).
+    "duckdb==1.5.5",
+    "pandas",
+    "keyring",
+    "platformdirs",
+    "fastapi",
+    "uvicorn",
+    "jinja2",
+]
+
+[project.optional-dependencies]
+desktop = [
+    "PySide6",
+]
+dev = [
+    "pytest",
+    "pyiceberg[pyarrow,sql-sqlite]",
+    "ruff",
+    "httpx",
+    # Wheel-contents test builds offline with --no-build-isolation.
+    "hatchling",
+    # Browser end-to-end tests (tests/web/test_e2e.py); they skip when no Chromium
+    # is installed (`playwright install chromium`).
+    "playwright",
+    # Building release wheels/sdists (release-web.yml).
+    "build",
+]
+dev-desktop = [
+    "floe[dev]",
+    "PySide6",
+    "pytest-qt",
+]
+
+[project.scripts]
+floe = "floe.cli:main"
+floe-desktop = "floe.__main__:main"
+
+[tool.hatch.version]
+# The package version comes from `src/floe/_build_info.py` when it exists (written
+# from the release tag by scripts/write_build_info.py in CI before the wheel is
+# built), falling back to `floe.__init__`'s dev default ("0.0.0.dev0") otherwise, so
+# `pip install -e .` still works in a plain checkout. See CLAUDE.md / SPEC §15.5.
+source = "code"
+path = "src/floe/__init__.py"
+search-paths = ["src"]
+
+[tool.hatch.build]
+# `_build_info.py` is gitignored (CLAUDE.md/SPEC §15.5: it only exists in a release
+# build), so hatchling's default VCS-aware file list would drop it from the sdist
+# and wheel. Force-include it so a release wheel carries the real version/commit.
+artifacts = ["src/floe/_build_info.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/floe"]
+artifacts = ["src/floe/_build_info.py"]
+
+[tool.pytest.ini_options]
+markers = [
+    "e2e: browser end-to-end tests (Playwright + Chromium; skipped when unavailable)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures imported from another test module and used as parameters look like
+# redefined-unused imports to ruff, which can't see the pytest fixture wiring.
+"tests/test_sql_tab.py" = ["F811", "E402"]
+"tests/test_polish.py" = ["F811", "E402"]
+# `pytest.importorskip("PySide6")` must run before importing PySide6/floe.ui,
+# so those imports can't be at the very top of the file (SPEC §15.5).
+"tests/test_browser.py" = ["E402"]
+"tests/test_profile_dialog.py" = ["E402"]
+"tests/test_ui_smoke.py" = ["E402"]

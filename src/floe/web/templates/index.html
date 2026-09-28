@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="floe-version" content="{{ version }}">
+  <title>Floe</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/floe.css">
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body data-profile-defaults="{{ profile_defaults }}">
+<header class="topbar" role="toolbar" aria-label="Main toolbar">
+  <span class="brand">Floe</span>
+  <label class="field-inline">Profile
+    <select id="profile-select" aria-label="Profile"></select>
+  </label>
+  <button type="button" id="btn-profiles">Profiles…</button>
+  <span class="sep"></span>
+  <label class="field-inline">Branch
+    <select id="branch-select" aria-label="Branch" disabled></select>
+  </label>
+  <button type="button" id="btn-refresh" title="Refresh the catalog (Ctrl/Cmd+R)" disabled>Refresh</button>
+  <button type="button" id="head-hash" class="hash" title="No head" disabled>—</button>
+  <span id="catalog-pill" class="pill pill-unknown" title="No catalog request has completed yet.">Catalog status unknown</span>
+  <label class="toggle" id="tenant-filter-label" title="Not applicable on the main branch">
+    <input type="checkbox" id="tenant-filter" checked disabled> Tenant filter
+  </label>
+  <span class="spacer"></span>
+  <div class="menu">
+    <button type="button" id="btn-help" aria-haspopup="menu" aria-expanded="false">Help ▾</button>
+    <div id="help-menu" class="menu-popup" role="menu" hidden>
+      <button type="button" role="menuitem" data-action="about">About Floe</button>
+      <button type="button" role="menuitem" data-action="diagnostics">Copy diagnostics</button>
+      <button type="button" role="menuitem" data-action="shortcuts">Keyboard shortcuts</button>
+      <button type="button" role="menuitem" data-action="ask-settings">Ask settings…</button>
+    </div>
+  </div>
+</header>
+
+<div class="workspace">
+  <aside class="sidebar" aria-label="Tables">
+    <input type="search" id="tree-filter" placeholder="Filter tables…" aria-label="Filter tables" autocomplete="off">
+    <div id="tree" class="tree" role="tree" tabindex="0" aria-label="Table tree"></div>
+    <div id="tree-message" class="tree-message">No profile selected.</div>
+  </aside>
+
+  <main class="main">
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button type="button" role="tab" class="tab" data-tab="preview" id="tabbtn-preview" title="Alt+1">Preview</button>
+      <button type="button" role="tab" class="tab" data-tab="schema" id="tabbtn-schema" title="Alt+2">Schema</button>
+      <button type="button" role="tab" class="tab" data-tab="sql" id="tabbtn-sql" title="Alt+3">SQL</button>
+    </nav>
+
+    <section id="tab-preview" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-preview">
+      <div class="panel-title" id="preview-title">Select a table in the tree.</div>
+      <div id="preview-results" class="results-host"></div>
+    </section>
+
+    <section id="tab-schema" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-schema" hidden>
+      <div class="panel-title" id="schema-title">Select a table in the tree.</div>
+      <div id="schema-results" class="results-host"></div>
+    </section>
+
+    <section id="tab-sql" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-sql" hidden>
+      <div class="sql-toolbar">
+        <button type="button" id="btn-run" class="primary" title="Run the selection, or everything (Ctrl/Cmd+Enter)">Run</button>
+        <button type="button" id="btn-cancel" title="Cancel the running query (Esc)" disabled>Cancel</button>
+        <label class="field-inline">Row limit
+          <input type="number" id="row-limit" min="1" max="1000000" step="1" value="10000" aria-label="Row limit">
+        </label>
+        <span class="sep"></span>
+        <label class="field-inline">History
+          <select id="history-select" aria-label="SQL history"><option value="">(no history)</option></select>
+        </label>
+        <button type="button" id="btn-clear-history" title="Clear this profile's SQL history">Clear</button>
+        <span class="spacer"></span>
+        <button type="button" id="btn-ask-toggle" aria-pressed="false" title="Generate SQL from a description">Ask…</button>
+      </div>
+      <div class="sql-body">
+        <div id="editor" class="editor" aria-label="SQL editor"></div>
+        <aside id="ask-panel" class="ask-panel" hidden aria-label="Ask">
+          <div class="ask-head">
+            <strong>Ask</strong>
+            <button type="button" id="btn-ask-settings" class="link">Settings…</button>
+          </div>
+          <p class="note ask-note">Only table and column names are sent — never data. Don't include patient identifiers in your question.</p>
+          <div id="ask-not-configured" class="notice" hidden>
+            Ask isn't set up yet. <button type="button" id="btn-ask-setup" class="link">Set up Ask…</button>
+          </div>
+          <textarea id="ask-question" rows="4" placeholder="Describe what you want" aria-label="Describe what you want"></textarea>
+          <div class="ask-mode" role="radiogroup" aria-label="Where to put the SQL">
+            <label><input type="radio" name="ask-mode" value="replace" checked> Replace editor</label>
+            <label><input type="radio" name="ask-mode" value="insert"> Insert at cursor</label>
+          </div>
+          <div class="button-row">
+            <button type="button" id="btn-ask-preview">What will be sent</button>
+            <button type="button" id="btn-ask-generate" class="primary">Generate SQL</button>
+            <button type="button" id="btn-ask-cancel" disabled>Cancel</button>
+          </div>
+          <div id="ask-status" class="ask-status" aria-live="polite"></div>
+          <ul id="ask-warnings" class="warnings" hidden></ul>
+          <pre id="ask-preview" class="ask-preview" hidden></pre>
+        </aside>
+      </div>
+      <div id="sql-results" class="results-host"></div>
+    </section>
+  </main>
+</div>
+
+<footer class="statusbar" id="statusbar" aria-live="polite"></footer>
+<div id="toast" class="toast" role="status" hidden></div>
+
+<!-- Profiles -->
+<dialog id="profiles-dialog" class="dialog dialog-wide" aria-labelledby="profiles-dialog-title">
+  <div class="dialog-head">
+    <h2 id="profiles-dialog-title">Profiles</h2>
+    <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="profiles-layout">
+    <div class="profiles-side">
+      <ul id="profile-list" class="profile-list" role="listbox" aria-label="Profiles"></ul>
+      <div class="button-col">
+        <button type="button" id="pf-new">New</button>
+        <button type="button" id="pf-duplicate">Duplicate</button>
+        <button type="button" id="pf-delete" class="danger">Delete</button>
+        <button type="button" id="pf-import">Import .env…</button>
+        <input type="file" id="pf-import-file" accept=".env,text/plain,*/*" hidden>
+      </div>
+    </div>
+    <form id="profile-form" class="profile-form" novalidate autocomplete="off">
+      <div id="pf-general-error" class="error-box" hidden></div>
+      <div id="pf-notes" class="notice" hidden></div>
+      <div id="pf-keyring-note" class="notice" hidden></div>
+      <div id="pf-fields"></div>
+      <div id="pf-test" class="test-steps" hidden>
+        <h3>Test connection</h3>
+        <ol id="pf-test-steps"></ol>
+        <div id="pf-test-summary"></div>
+      </div>
+    </form>
+  </div>
+  <div class="dialog-foot">
+    <span id="pf-status" class="muted"></span>
+    <span class="spacer"></span>
+    <button type="button" id="pf-test-btn">Test connection</button>
+    <button type="button" id="pf-save" class="primary">Save</button>
+    <button type="button" data-close>Close</button>
+  </div>
+</dialog>
+
+<!-- Ask settings -->
+<dialog id="ask-settings-dialog" class="dialog" aria-labelledby="ask-settings-title">
+  <div class="dialog-head">
+    <h2 id="ask-settings-title">Ask settings</h2>
+    <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+  </div>
+  <form id="ask-settings-form" class="form-grid" novalidate autocomplete="off">
+    <div id="as-error" class="error-box span2" hidden></div>
+    <label for="as-enabled">Enabled</label>
+    <span><input type="checkbox" id="as-enabled"></span>
+    <label for="as-model">Model ID</label>
+    <span>
+      <input type="text" id="as-model" placeholder="vendor/model-name:free" spellcheck="false">
+      <small class="hint">Any OpenRouter model ID. Free models (IDs ending in <code>:free</code>) are listed on openrouter.ai/models; see the README for suggestions.</small>
+    </span>
+    <label for="as-base-url">Base URL</label>
+    <span><input type="url" id="as-base-url" spellcheck="false"></span>
+    <label for="as-timeout">Timeout (s)</label>
+    <span><input type="number" id="as-timeout" min="1" max="600" step="1"></span>
+    <label for="as-api-key">API key</label>
+    <span class="secret-row">
+      <input type="password" id="as-api-key" autocomplete="new-password">
+      <button type="button" id="as-api-key-clear">Clear</button>
+      <small class="hint" id="as-api-key-hint"></small>
+    </span>
+  </form>
+  <div class="dialog-foot">
+    <span class="spacer"></span>
+    <button type="button" id="as-save" class="primary">Save</button>
+    <button type="button" data-close>Cancel</button>
+  </div>
+</dialog>
+
+<!-- Confirm / prompt -->
+<dialog id="confirm-dialog" class="dialog dialog-small" aria-labelledby="confirm-title">
+  <div class="dialog-head"><h2 id="confirm-title">Confirm</h2></div>
+  <div class="dialog-body">
+    <p id="confirm-message"></p>
+    <input type="text" id="confirm-input" hidden aria-label="Value" spellcheck="false">
+  </div>
+  <div class="dialog-foot">
+    <span class="spacer"></span>
+    <button type="button" id="confirm-ok" class="primary">OK</button>
+    <button type="button" id="confirm-cancel">Cancel</button>
+  </div>
+</dialog>
+
+<!-- About -->
+<dialog id="about-dialog" class="dialog dialog-small" aria-labelledby="about-title">
+  <div class="dialog-head">
+    <h2 id="about-title">About Floe</h2>
+    <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="dialog-body">
+    <p>Browse and query Iceberg tables (Nessie + DuckDB). Read-only.</p>
+    <p>Version <strong id="about-version">{{ version }}</strong> · commit <code id="about-commit">…</code></p>
+  </div>
+  <div class="dialog-foot"><span class="spacer"></span><button type="button" data-close>Close</button></div>
+</dialog>
+
+<!-- Shortcuts -->
+<dialog id="shortcuts-dialog" class="dialog dialog-small" aria-labelledby="shortcuts-title">
+  <div class="dialog-head">
+    <h2 id="shortcuts-title">Keyboard shortcuts</h2>
+    <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="dialog-body">
+    <table class="shortcuts">
+      <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>Enter</kbd></td><td>Run the selection, or the whole editor</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Cancel the running query</td></tr>
+      <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>R</kbd></td><td>Refresh the catalog</td></tr>
+      <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>F</kbd></td><td>Filter tables (outside the editor)</td></tr>
+      <tr><td><kbd>Alt</kbd>+<kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd></td><td>Preview / Schema / SQL tab</td></tr>
+      <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>C</kbd></td><td>Copy selected cells as TSV (in a grid)</td></tr>
+      <tr><td><kbd>Ctrl/Cmd</kbd>+<kbd>A</kbd></td><td>Select all cells on the page (in a grid)</td></tr>
+      <tr><td>Double-click a table</td><td>Insert its view name into the SQL editor</td></tr>
+    </table>
+  </div>
+  <div class="dialog-foot"><span class="spacer"></span><button type="button" data-close>Close</button></div>
+</dialog>
+</body>
+</html>
