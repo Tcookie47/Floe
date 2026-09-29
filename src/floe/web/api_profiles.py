@@ -18,17 +18,22 @@ import dataclasses
 import ipaddress
 import json
 import logging
+import re
 import urllib.parse
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 
 from floe.core import diagnostics
 from floe.core.profiles import (
     SECRET_FIELDS,
     Profile,
+    ProfileImportError,
+    export_profile,
     keyring_usable,
     parse_env_text,
+    parse_profile_export,
+    required_secrets,
     secret_env_var_name,
 )
 from floe.web.state import ApiError, JsonBody, OptionalJson, State, WebState
@@ -314,6 +319,42 @@ async def import_env(request: Request, state: State) -> dict[str, Any]:
     }
 
 
+@router.post("/import-profile")
+def import_profile(payload: JsonBody) -> dict[str, Any]:
+    """Parse a profile file's contents (`{"text": ...}`). Saves nothing."""
+    text = payload.get("text")
+    if not isinstance(text, str):
+        raise _bad('Send the profile file contents as {"text": ...}.')
+    try:
+        result = parse_profile_export(text)
+    except ProfileImportError as exc:
+        raise _bad("; ".join(exc.errors)) from None
+    return {
+        "fields": result.fields,
+        "notes": result.notes,
+        "missing_secrets": result.missing_secrets,
+    }
+
+
+def export_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")[:80] or "profile"
+    return f"{safe}.floe-profile.json"
+
+
+@router.get("/{name}/export")
+def export_profile_file(name: str, state: State) -> Response:
+    profile = _get_profile(state, name)
+    body = json.dumps(export_profile(profile), indent=2, sort_keys=False) + "\n"
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{export_filename(name)}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.get("/{name}")
 def get_profile(name: str, state: State) -> dict[str, Any]:
     return profile_payload(state, _get_profile(state, name))
@@ -383,13 +424,7 @@ _SECRET_DESTINATIONS = {
 
 
 def _needed_secrets(profile: Profile) -> set[str]:
-    needed: set[str] = set()
-    if profile.mode == "local":
-        return needed
-    if profile.nessie_auth == "oauth2":
-        needed.add("nessie_client_secret")
-    needed.add("adls_account_key" if profile.adls_auth == "account_key" else "adls_client_secret")
-    return needed
+    return set(required_secrets(profile))
 
 
 def _reusable_saved_secrets(

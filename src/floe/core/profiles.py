@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass, field, fields
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -247,6 +248,221 @@ def parse_env_text(text: str) -> EnvImport:
             "client secret directly instead."
         )
 
+    return result
+
+
+# --------------------------------------------------------------------------- profile files
+# Export / import of a profile as a shareable JSON file. Settings only: secrets are never
+# written to, or read from, such a file.
+
+EXPORT_FORMAT = "floe-profile"
+EXPORT_VERSION = 1
+MAX_EXPORT_BYTES = 256 * 1024
+_MAX_NAME = 100
+_MAX_TEXT = 4096
+_MAX_INT = {"preview_row_limit": 1_000_000}
+
+# Validation kind per Profile field (kept in sync with the dataclass by a test).
+IMPORT_FIELD_KINDS: dict[str, Any] = {
+    "name": "name",
+    "mode": ("remote", "local"),
+    "local_fixture_dir": "opt_str",
+    "adls_account": "str",
+    "adls_auth": ("account_key", "service_principal"),
+    "adls_tenant_id": "str",
+    "adls_client_id": "str",
+    "adls_ca_cert_file": "opt_str",
+    "nessie_uri": "str",
+    "nessie_auth": ("oauth2", "none"),
+    "nessie_token_endpoint": "str",
+    "nessie_client_id": "str",
+    "nessie_scope": "str",
+    "nessie_main_ref": "str",
+    "nessie_head_ttl_seconds": "int",
+    "shared_containers": "str_list",
+    "shared_namespaces": "str_list",
+    "tenant_registry_table": "opt_str",
+    "tenant_container_map": "str_map",
+    "tenant_data_source_map": "str_map",
+    "duckdb_memory_limit": "opt_str",
+    "duckdb_threads": "opt_int",
+    "conn_cache_max": "pos_int",
+    "allow_export": "bool",
+    "preview_row_limit": "pos_int",
+    "restrict_file_access": "bool",
+}
+
+SECRETS_NOT_IMPORTED_NOTE = (
+    "The file contained secret fields, which were ignored: secrets are never imported "
+    "from files — enter them manually."
+)
+
+
+class ProfileImportError(ValueError):
+    """A profile file was rejected. `errors` lists every problem found (never values)."""
+
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = errors
+        super().__init__("; ".join(errors))
+
+
+@dataclass
+class ProfileImport:
+    """The result of parsing a profile file. Nothing is saved here."""
+
+    fields: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    missing_secrets: list[str] = field(default_factory=list)
+
+
+def required_secrets(profile: Profile) -> list[str]:
+    """The secret fields the profile's chosen auth modes need (none in local mode)."""
+    if profile.mode == "local":
+        return []
+    needed = {"adls_account_key" if profile.adls_auth == "account_key" else "adls_client_secret"}
+    if profile.nessie_auth == "oauth2":
+        needed.add("nessie_client_secret")
+    return [f for f in SECRET_FIELDS if f in needed]
+
+
+def export_profile(profile: Profile) -> dict[str, Any]:
+    """The shareable form of `profile`: non-secret fields only, no secret keys at all."""
+    from floe import __version__
+
+    data = {k: v for k, v in profile.to_dict().items() if k not in SECRET_FIELDS}
+    return {
+        "format": EXPORT_FORMAT,
+        "version": EXPORT_VERSION,
+        "exported_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "floe_version": __version__,
+        "profile": data,
+    }
+
+
+def _check_field(key: str, kind: Any, value: object, errors: list[str]) -> Any:
+    def bad(msg: str) -> None:
+        errors.append(f"{key}: {msg}")
+
+    def text(v: object) -> str | None:
+        if not isinstance(v, str) or len(v) > _MAX_TEXT:
+            return None
+        return v.strip()
+
+    def integer(v: object, minimum: int) -> int | None:
+        if not isinstance(v, int) or isinstance(v, bool) or v < minimum:
+            return None
+        return v
+
+    if kind == "name":
+        v = text(value)
+        if not v:
+            bad("must be a non-empty string.")
+        elif len(v) > _MAX_NAME:
+            bad(f"is too long (max {_MAX_NAME} characters).")
+        elif any(ord(c) < 32 or c in "\x7f:" for c in v):
+            bad("may not contain control characters or ':'.")
+        return v
+    if isinstance(kind, tuple):
+        if value not in kind:
+            bad(f"must be one of {', '.join(kind)}.")
+        return value
+    if kind == "str":
+        v = text(value)
+        if v is None:
+            bad(f"must be a string (max {_MAX_TEXT} characters).")
+        return v
+    if kind == "opt_str":
+        if value is None:
+            return None
+        v = text(value)
+        if v is None:
+            bad(f"must be a string or null (max {_MAX_TEXT} characters).")
+        return v or None
+    if kind in ("int", "pos_int", "opt_int"):
+        if value is None and kind == "opt_int":
+            return None
+        minimum = 0 if kind == "int" else 1
+        n = integer(value, minimum)
+        if n is None:
+            suffix = " or null." if kind == "opt_int" else "."
+            bad(f"must be a whole number >= {minimum}{suffix}")
+        elif key in _MAX_INT and n > _MAX_INT[key]:
+            bad(f"must be at most {_MAX_INT[key]:,}.")
+        return n
+    if kind == "bool":
+        if not isinstance(value, bool):
+            bad("must be true or false.")
+        return value
+    if kind == "str_list":
+        if not isinstance(value, list):
+            bad("must be a list of strings.")
+            return None
+        items = [text(v) for v in value]
+        if any(i is None for i in items):
+            bad("must be a list of strings.")
+            return None
+        return [i for i in items if i]
+    if kind == "str_map":
+        if not isinstance(value, dict):
+            bad("must be an object of strings.")
+            return None
+        out: dict[str, str] = {}
+        for k, v in value.items():
+            tv = text(v)
+            if tv is None:
+                bad("must be an object of strings.")
+                return None
+            if k.strip():
+                out[k.strip()] = tv
+        return out
+    return value  # pragma: no cover
+
+
+def parse_profile_export(text: str) -> ProfileImport:
+    """Strictly parse the contents of a profile file (see `export_profile`). Saves nothing.
+    Raises `ProfileImportError` (messages never contain file values). Secret-named keys
+    are ignored with a warning; unknown fields are dropped with a note."""
+    if not isinstance(text, str):
+        raise ProfileImportError(["The profile file must be text."])
+    if len(text.encode("utf-8", errors="replace")) > MAX_EXPORT_BYTES:
+        raise ProfileImportError(
+            [f"The profile file is too large (max {MAX_EXPORT_BYTES // 1024} KB)."]
+        )
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ProfileImportError(["The file is not valid JSON."]) from None
+    if not isinstance(data, dict):
+        raise ProfileImportError(["The file must contain a JSON object."])
+    if data.get("format") != EXPORT_FORMAT:
+        raise ProfileImportError([f'Not a Floe profile file (format must be "{EXPORT_FORMAT}").'])
+    version = data.get("version")
+    if isinstance(version, bool) or version != EXPORT_VERSION or not isinstance(version, int):
+        raise ProfileImportError([f"Unsupported profile file version (expected {EXPORT_VERSION})."])
+    body = data.get("profile")
+    if not isinstance(body, dict):
+        raise ProfileImportError(['"profile" must be an object.'])
+
+    result = ProfileImport()
+    secret_keys = (set(body) | set(data)) & set(SECRET_FIELDS)
+    if secret_keys:
+        result.notes.append(SECRETS_NOT_IMPORTED_NOTE)
+    unknown = sorted(str(k) for k in body if k not in IMPORT_FIELD_KINDS and k not in SECRET_FIELDS)
+    if unknown:
+        result.notes.append(f"Ignored unknown field(s): {', '.join(unknown)}.")
+
+    errors: list[str] = []
+    if "name" not in body:
+        errors.append("name: is required.")
+    for key, kind in IMPORT_FIELD_KINDS.items():
+        if key in body:
+            result.fields[key] = _check_field(key, kind, body[key], errors)
+    if errors:
+        raise ProfileImportError(errors)
+    profile = Profile.from_dict(result.fields)
+    if profile.mode == "local" and not profile.local_fixture_dir:
+        result.notes.append("Local mode needs a local fixture directory; set one before saving.")
+    result.missing_secrets = required_secrets(profile)
     return result
 
 

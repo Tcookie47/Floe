@@ -659,6 +659,62 @@ def test_profiles_import_env_keyring_error_duplicate_delete(browser, server, ice
     context.close()
 
 
+def test_profile_export_and_import_round_trip(browser, server, tmp_path):
+    ProfileStore().save(
+        Profile(
+            name="e2e-share",
+            adls_account="acctsynthetic",
+            nessie_uri="https://nessie.invalid/api/v2",
+            nessie_token_endpoint="https://auth.invalid/token",
+            nessie_client_id="client-synthetic",
+            shared_containers=["ref-a"],
+        )
+    )
+    context, page, console = _new_page(browser)
+    _open(page, server["url"])
+    page.click("#btn-profiles")
+    expect(page.locator("#pf-name")).to_have_value("e2e-share")
+    expect(page.locator("#pf-export")).to_be_enabled()
+
+    # Export: confirm text, then the download (fetch + blob) carries settings only.
+    page.click("#pf-export")
+    expect(page.locator("#confirm-message")).to_contain_text("no keys, secrets or passwords")
+    expect(page.locator("#confirm-message")).to_contain_text("share it only with people")
+    with page.expect_download() as info:
+        page.click("#confirm-ok")
+    download = info.value
+    assert download.suggested_filename == "e2e-share.floe-profile.json"
+    path = tmp_path / "exported.json"
+    download.save_as(path)
+    text = path.read_text(encoding="utf-8")
+    data = json.loads(text)
+    assert data["format"] == "floe-profile" and data["profile"]["adls_account"] == "acctsynthetic"
+    for name in ("adls_account_key", "adls_client_secret", "nessie_client_secret"):
+        assert name not in text
+
+    # Import it back: a NEW profile (name clash -> suffix), secrets flagged, nothing saved yet.
+    page.set_input_files("#pf-import-profile-file", files=[str(path)])
+    expect(page.locator("#pf-name")).to_have_value("e2e-share (imported)")
+    expect(page.locator("#pf-adls_account")).to_have_value("acctsynthetic")
+    expect(page.locator("#pf-nessie_uri")).to_have_value("https://nessie.invalid/api/v2")
+    expect(page.locator("#pf-shared_containers")).to_have_value("ref-a")
+    expect(page.locator("#pf-notes")).to_contain_text("Nothing is saved until you click Save")
+    for field in ("adls_account_key", "nessie_client_secret"):
+        expect(page.locator(f"#pf-{field}")).to_have_class(re.compile("needs-secret"))
+        expect(page.locator(f"#pf-{field}-hint")).to_contain_text(
+            "Enter manually — not included in profile files"
+        )
+    expect(page.locator("#profile-list li")).to_have_text(["e2e-share", "(new profile)"])
+    assert [p.name for p in ProfileStore().list()] == ["e2e-share"]
+
+    page.click("#pf-save")
+    expect(page.locator("#pf-status")).to_have_text('Saved "e2e-share (imported)".')
+    expect(page.locator("#profile-list li")).to_have_text(["e2e-share", "e2e-share (imported)"])
+    expect(page.locator("#profile-select option[value='e2e-share (imported)']")).to_have_count(1)
+    console.assert_clean()
+    context.close()
+
+
 # --------------------------------------------------------------------------- auth
 
 

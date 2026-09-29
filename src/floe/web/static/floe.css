@@ -352,6 +352,8 @@ option.inactive { color: var(--fg-dim); }
 .secret-row input { flex: 1 1 200px; }
 .secret-row .hint { flex-basis: 100%; }
 .field-error { display: block; color: var(--err); font-size: var(--fs-small); }
+input.needs-secret { border-color: var(--warn, var(--err)); }
+.secret-row .hint.needs-secret-hint { color: var(--err); }
 .invalid { border-color: var(--err) !important; }
 .error-box {
   padding: 6px 10px; margin: 6px 0; border: 1px solid var(--err); border-radius: 4px; background: var(--err-bg);

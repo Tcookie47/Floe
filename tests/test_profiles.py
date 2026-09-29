@@ -409,3 +409,143 @@ def test_parse_env_file_ignores_comments_and_blank_lines(tmp_path):
 
     result = parse_env_file(env_path)
     assert result.fields["adls_account"] == "acct-a"
+
+
+# --------------------------------------------------------------------------- profile files
+
+from floe.core.profiles import (  # noqa: E402
+    IMPORT_FIELD_KINDS,
+    MAX_EXPORT_BYTES,
+    ProfileImportError,
+    export_profile,
+    parse_profile_export,
+)
+
+
+def _full_profile(name: str = "eg-test1") -> Profile:
+    return Profile(
+        name=name,
+        adls_account="acctsynthetic",
+        nessie_uri="https://nessie.invalid/api/v2",
+        nessie_token_endpoint="https://auth.invalid/token",
+        nessie_client_id="client-synthetic",
+        shared_containers=["ref-a"],
+        shared_namespaces=["ns-a"],
+        tenant_container_map={"eg-test1": "ref-a"},
+        duckdb_threads=4,
+        allow_export=True,
+    )
+
+
+def _file(**profile_overrides) -> dict:
+    data = export_profile(_full_profile())
+    data["profile"].update(profile_overrides)
+    return data
+
+
+def test_import_field_kinds_cover_profile_fields():
+    import dataclasses
+
+    assert set(IMPORT_FIELD_KINDS) == {f.name for f in dataclasses.fields(Profile)}
+
+
+def test_export_round_trip(tmp_path):
+    profile = _full_profile()
+    data = export_profile(profile)
+    assert data["format"] == "floe-profile" and data["version"] == 1
+    assert data["exported_at"].endswith("Z") and data["floe_version"]
+    result = parse_profile_export(json.dumps(data))
+    assert Profile.from_dict(result.fields) == profile
+    assert result.notes == []
+
+
+def test_export_never_contains_secrets(tmp_path):
+    from floe.core import diagnostics
+
+    store = _store(tmp_path)
+    profile = _full_profile()
+    secrets = {
+        "adls_account_key": "synthetic-key-AAAA-123456",
+        "adls_client_secret": "synthetic-sp-BBBB-123456",
+        "nessie_client_secret": "synthetic-nessie-CCCC-123456",
+    }
+    store.save(profile, secrets=secrets)
+    for value in secrets.values():
+        diagnostics.register_secret(value)
+    text = json.dumps(export_profile(store.get(profile.name)))
+    for name in SECRET_FIELDS:
+        assert name not in text
+    for value in secrets.values():
+        assert value not in text
+    assert diagnostics.redact(text) == text  # nothing registered was found
+
+
+def test_import_ignores_secret_keys_with_warning():
+    data = _file(adls_account_key="synthetic-key-AAAA-123456", nessie_client_secret="x" * 12)
+    data["adls_client_secret"] = "top-level-secret-123"
+    result = parse_profile_export(json.dumps(data))
+    assert not set(result.fields) & set(SECRET_FIELDS)
+    assert any("never imported from files" in n and "manually" in n for n in result.notes)
+    assert "synthetic-key-AAAA-123456" not in json.dumps(result.__dict__)
+
+
+def test_import_unknown_fields_dropped_with_note():
+    result = parse_profile_export(json.dumps(_file(surprise=1)))
+    assert "surprise" not in result.fields
+    assert any("surprise" in n for n in result.notes)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not json",
+        "[]",
+        json.dumps({"format": "other", "version": 1, "profile": {"name": "x"}}),
+        json.dumps({"format": "floe-profile", "version": 2, "profile": {"name": "x"}}),
+        json.dumps({"format": "floe-profile", "version": True, "profile": {"name": "x"}}),
+        json.dumps({"format": "floe-profile", "version": 1, "profile": []}),
+        json.dumps({"format": "floe-profile", "version": 1, "profile": {}}),
+    ],
+)
+def test_import_rejects_bad_envelope(text):
+    with pytest.raises(ProfileImportError):
+        parse_profile_export(text)
+
+
+def test_import_per_field_type_errors():
+    data = _file(
+        mode="cloud",
+        nessie_head_ttl_seconds="45",
+        shared_containers="ref-a",
+        allow_export="yes",
+        preview_row_limit=0,
+        tenant_container_map={"a": 1},
+    )
+    with pytest.raises(ProfileImportError) as exc:
+        parse_profile_export(json.dumps(data))
+    joined = " | ".join(exc.value.errors)
+    for key in ("mode", "nessie_head_ttl_seconds", "shared_containers", "allow_export",
+                "preview_row_limit", "tenant_container_map"):
+        assert any(e.startswith(f"{key}:") for e in exc.value.errors), joined
+    assert "45" not in joined.replace("nessie_head_ttl_seconds", "")
+
+
+def test_import_size_cap():
+    data = _file(nessie_scope="s")
+    data["padding"] = "x" * MAX_EXPORT_BYTES
+    with pytest.raises(ProfileImportError, match="too large"):
+        parse_profile_export(json.dumps(data))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, ["adls_account_key", "nessie_client_secret"]),
+        ({"adls_auth": "service_principal"}, ["adls_client_secret", "nessie_client_secret"]),
+        ({"nessie_auth": "none"}, ["adls_account_key"]),
+        ({"adls_auth": "service_principal", "nessie_auth": "none"}, ["adls_client_secret"]),
+        ({"mode": "local", "local_fixture_dir": "/x"}, []),
+    ],
+)
+def test_import_missing_secrets_per_auth_mode(overrides, expected):
+    assert parse_profile_export(json.dumps(_file(**overrides))).missing_secrets == expected

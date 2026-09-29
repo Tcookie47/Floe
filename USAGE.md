@@ -184,6 +184,26 @@ client secret directly instead. Imported secrets are held in server memory
 for 10 minutes (tied to that import) and are only written to the keyring
 when you click **Save**.
 
+### Share a profile with a teammate (Export / Import)
+
+1. Select the saved profile in **Profiles…** and click **Export…**.
+2. Read the confirmation and click **Export**. Your browser downloads
+   `<name>.floe-profile.json`.
+3. Send the file to your teammate. They open **Profiles…**, click **Import
+   profile…** and pick the file. Floe fills the form as a **new** profile
+   (if the name is taken it gets an " (imported)" suffix). Nothing is saved
+   until they click **Save**.
+4. They **enter the secrets themselves** (account key, client secret, Nessie
+   client secret). The fields the profile needs are highlighted with "Enter
+   manually — not included in profile files".
+
+**Secrets are never included.** The file holds settings only — no keys,
+client secrets or passwords — and if a file somehow contains secret fields,
+Floe ignores them on import with a warning. **Sharing caution:** the file
+does contain your Nessie address, storage account, containers, namespaces and
+branch names, so share it only with people who should have them. Files must
+be ≤ 256 KB.
+
 ### Duplicate / Rename / Delete
 
 - **Duplicate**: select a profile, click **Duplicate**, give the copy a new

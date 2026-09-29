@@ -367,3 +367,61 @@ def test_form_shaped_profiles_save_without_spurious_errors(client, tmp_path):
     assert err.get("field") == "nessie_token_endpoint"
     assert "https://" in err["message"]
     assert_no_secrets(client)
+
+
+# --------------------------------------------------------------------------- export / import
+
+
+def _save_remote(client):
+    r = client.post(
+        "/api/profiles",
+        json={
+            "profile": {**REMOTE, "name": "we\"ird; name"},
+            "secrets": {"adls_account_key": KEY_SECRET, "nessie_client_secret": CLIENT_SECRET},
+        },
+    )
+    assert r.status_code == 201, r.text
+
+
+def test_export_profile_headers_and_no_secrets(client):
+    _save_remote(client)
+    r = client.get("/api/profiles/we%22ird%3B%20name/export")
+    assert r.status_code == 200, r.text
+    assert r.headers["cache-control"] == "no-store"
+    disposition = r.headers["content-disposition"]
+    assert disposition == 'attachment; filename="we_ird_name.floe-profile.json"'
+    body = r.json()
+    assert body["format"] == "floe-profile" and body["profile"]["adls_account"] == "acctsynthetic"
+    for secret in ALL_SECRETS:
+        assert secret not in r.text
+    for name in SECRET_FIELDS:
+        assert name not in r.text
+    assert client.get("/api/profiles/nope/export").status_code == 404
+
+
+def test_export_and_import_need_the_api_key(client):
+    _save_remote(client)
+    client.headers.pop("X-Floe-Auth")
+    assert client.get("/api/profiles/we%22ird%3B%20name/export").status_code == 401
+    assert client.post("/api/profiles/import-profile", json={"text": "{}"}).status_code == 401
+
+
+def test_import_profile_does_not_persist(client, store):
+    _save_remote(client)
+    text = client.get("/api/profiles/we%22ird%3B%20name/export").text
+    before = [p.name for p in store.list()]
+    r = client.post("/api/profiles/import-profile", json={"text": text})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fields"]["name"] == "we\"ird; name"
+    assert body["missing_secrets"] == ["adls_account_key", "nessie_client_secret"]
+    assert [p.name for p in store.list()] == before
+    assert client.get("/api/profiles").json()["profiles"] == [
+        p.to_dict() for p in store.list()
+    ]
+
+
+def test_import_profile_rejects_bad_files(client):
+    r = client.post("/api/profiles/import-profile", json={"text": "not json"})
+    assert r.status_code == 400 and r.json()["error"]["type"] == "ValidationError"
+    assert client.post("/api/profiles/import-profile", json={}).status_code == 400

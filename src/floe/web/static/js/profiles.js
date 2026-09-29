@@ -2,7 +2,7 @@
 // Delete / Import .env / Test connection / Save. Secret inputs are never pre-filled: they
 // show "(saved)" when a value exists; typing sets a new value, Clear removes it on Save.
 
-import { api, enc, errorText, JobHandle } from "./api.js";
+import { api, authHeaders, enc, errorText, JobHandle } from "./api.js";
 import { $, clear, confirmDialog, h, toast } from "./dom.js";
 
 const GENERAL = "General";
@@ -91,6 +91,7 @@ export class ProfilesDialog {
     this.secretCleared = {};
     this.importId = null;
     this.importedSecrets = new Set();
+    this.requiredSecrets = new Set();
     this.keyringAvailable = true;
     this.dirty = false;
     this.testJob = null;
@@ -102,6 +103,9 @@ export class ProfilesDialog {
     $("#pf-delete").addEventListener("click", () => this.remove());
     $("#pf-import").addEventListener("click", () => $("#pf-import-file").click());
     $("#pf-import-file").addEventListener("change", (e) => this.importEnv(e.target));
+    $("#pf-import-profile").addEventListener("click", () => $("#pf-import-profile-file").click());
+    $("#pf-import-profile-file").addEventListener("change", (e) => this.importProfileFile(e.target));
+    $("#pf-export").addEventListener("click", () => this.exportProfile());
     $("#pf-save").addEventListener("click", () => this.save());
     $("#pf-test-btn").addEventListener("click", () => this.testConnection());
     $("#profile-form").addEventListener("submit", (e) => { e.preventDefault(); this.save(); });
@@ -164,7 +168,10 @@ export class ProfilesDialog {
     this.dirty = true;
     this.setFieldError(field.name, null);
     if (["mode", "adls_auth", "nessie_auth"].includes(field.name)) this.updateVisibility();
-    if (field.kind === "secret" && this.inputs[field.name].value) this.secretCleared[field.name] = false;
+    if (field.kind === "secret") {
+      if (this.inputs[field.name].value) this.secretCleared[field.name] = false;
+      this.updateSecretHints();
+    }
     if (field.name === "name") this.updateKeyringNote();
   }
 
@@ -218,8 +225,14 @@ export class ProfilesDialog {
         input.placeholder = this.secretSaved[name] ? "(saved)" : "";
       }
       clearBtn.disabled = !(this.secretSaved[name] || this.importedSecrets.has(name)) || this.secretCleared[name];
-      hint.textContent = this.keyringAvailable ? "" :
+      const keyringHint = this.keyringAvailable ? "" :
         `No usable OS keyring: set ${secretEnvVar(this.inputs.name.value.trim() || "<profile>", name)} before starting Floe.`;
+      const flagged = this.requiredSecrets.has(name) && !input.value;
+      input.classList.toggle("needs-secret", flagged);
+      hint.classList.toggle("needs-secret-hint", flagged);
+      hint.textContent = flagged
+        ? `Enter manually — not included in profile files.${keyringHint ? " " + keyringHint : ""}`
+        : keyringHint;
     }
   }
 
@@ -372,6 +385,7 @@ export class ProfilesDialog {
     if (this.current === null) {
       this.list.append(h("li", { class: "new selected", role: "option", "aria-selected": "true", text: "(new profile)" }));
     }
+    $("#pf-export").disabled = this.current === null;
     $("#pf-duplicate").disabled = this.current === null;
     $("#pf-delete").disabled = this.current === null;
   }
@@ -382,6 +396,7 @@ export class ProfilesDialog {
   }
 
   resetTransient() {
+    this.requiredSecrets = new Set();
     this.importId = null;
     this.importedSecrets = new Set();
     this.secretCleared = {};
@@ -493,6 +508,82 @@ export class ProfilesDialog {
     }
   }
 
+  // ----- profile export / import ---------------------------------------------------------
+  async exportProfile() {
+    if (this.current === null) return;
+    const name = this.current;
+    const ok = await confirmDialog(
+      "Settings only — no keys, secrets or passwords are included. The file does contain your " +
+      "Nessie address, storage account, containers and branch names, so share it only with " +
+      "people who should have them.",
+      { title: `Export profile "${name}"`, ok: "Export" });
+    if (!ok) return;
+    try {
+      const response = await fetch(`/api/profiles/${enc(name)}/export`, {
+        headers: authHeaders({ Accept: "application/json" }), credentials: "same-origin",
+      });
+      if (!response.ok) {
+        let payload = null;
+        try { payload = (await response.json()).error; } catch { payload = null; }
+        throw Object.assign(new Error((payload && payload.message) || `Export failed (HTTP ${response.status}).`),
+          { type: payload && payload.type, status: response.status });
+      }
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = /filename="([^"]+)"/.exec(disposition);
+      const filename = match ? match[1] : "profile.floe-profile.json";
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = h("a", { href: url, download: filename });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      toast(`Exported "${name}" to ${filename}.`);
+    } catch (err) {
+      this.showError(err);
+    }
+  }
+
+  uniqueName(base) {
+    const taken = new Set(this.profiles.map((p) => p.name));
+    if (!taken.has(base)) return base;
+    let candidate = `${base} (imported)`;
+    for (let n = 2; taken.has(candidate); n += 1) candidate = `${base} (imported ${n})`;
+    return candidate;
+  }
+
+  async importProfileFile(input) {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file) return;
+    if (this.dirty && !(await confirmDialog("Discard unsaved changes to this profile?",
+      { title: "Unsaved changes", ok: "Discard" }))) return;
+    if (file.size > 256 * 1024) { this.showError(new Error("The profile file is too large.")); return; }
+    try {
+      const text = await file.text();
+      const data = await api.post("/api/profiles/import-profile", { text });
+      const fields = { ...data.fields };
+      const original = String(fields.name || "");
+      fields.name = this.uniqueName(original);
+      this.newProfile(fields);
+      this.dirty = true;
+      this.requiredSecrets = new Set(data.missing_secrets);
+      this.updateSecretHints();
+      const notes = [`Imported profile settings from ${file.name}. Nothing is saved until you click Save.`];
+      if (fields.name !== original) notes.push(`A profile named "${original}" already exists, so this one is named "${fields.name}".`);
+      if (data.missing_secrets.length) {
+        const labels = data.missing_secrets.map((s) => FIELDS.find((f) => f.name === s).label);
+        notes.push(`Enter manually — not included in profile files: ${labels.join(", ")}.`);
+      }
+      notes.push(...data.notes);
+      const box = $("#pf-notes");
+      box.textContent = notes.join("\n");
+      box.hidden = false;
+    } catch (err) {
+      this.showError(err);
+    }
+  }
+
   // ----- save ------------------------------------------------------------------------------
   async save() {
     const collected = this.collect();
@@ -520,6 +611,7 @@ export class ProfilesDialog {
       this.keyringAvailable = data.keyring_available;
       this.importId = null;
       this.importedSecrets = new Set();
+      this.requiredSecrets = new Set();
       this.secretCleared = {};
       this.fill(data.profile);
       this.dirty = false;
