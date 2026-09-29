@@ -14,6 +14,8 @@ Floe ships two front ends that share the same core:
 
 ## Install (web app — macOS, Linux, Windows)
 
+New to Floe? Follow the step-by-step [INSTALL.md](INSTALL.md).
+
 See [USAGE.md](USAGE.md) for a full setup and usage guide.
 
 **Prerequisites:** Python 3.12 or later, and [pipx](https://pipx.pypa.io/).
@@ -51,7 +53,7 @@ printed URL manually.
 
 - Profiles, SQL history, logs and UI preferences are stored in your OS's
   standard per-user app-data directory (via `platformdirs`): e.g.
-  `~/Library/Application Support/Floe` on macOS, `~/.local/share/floe` on
+  `~/Library/Application Support/Floe` on macOS, `~/.local/share/Floe` on
   Linux, `%LOCALAPPDATA%\Floe` on Windows. Set `FLOE_HOME` to override this
   (mainly for tests).
 - Secrets (account keys, client secrets, the OpenRouter API key) are stored

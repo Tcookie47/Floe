@@ -7,6 +7,8 @@ frozen Qt desktop app is documented separately in the README.
 
 ---
 
+First time? See the step-by-step [INSTALL.md](INSTALL.md).
+
 ## 1. Install & start
 
 **Prerequisites:** Python 3.12+ and [pipx](https://pipx.pypa.io/). See the
