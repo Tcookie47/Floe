@@ -4,9 +4,9 @@
 
 import { $$, clear, copyText, fmtInt, h, toast } from "./dom.js";
 
-const NUMERIC = /int|float|double|decimal|numeric|real|uint/i;
+export const NUMERIC = /int|float|double|decimal|numeric|real|uint/i;
 
-function cellText(value) {
+export function cellText(value) {
   if (value === null || value === undefined) return "NULL";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
@@ -28,8 +28,9 @@ function compare(a, b) {
 }
 
 export class ResultsView {
-  constructor(host, { pageSize = 500, paged = true, exportable = true, onExport = null } = {}) {
+  constructor(host, { pageSize = 500, paged = true, exportable = true, onExport = null, onImage = null } = {}) {
     this.host = host;
+    this.onImage = onImage;
     this.pageSize = pageSize;
     this.paged = paged;
     this.onExport = onExport;
@@ -46,8 +47,10 @@ export class ResultsView {
     this.pager = h("span", { class: "pager", hidden: true },
       this.firstBtn, this.prevBtn, this.pageLabel, this.nextBtn, this.lastBtn);
     this.exportBtn = h("button", { type: "button", class: "export-btn", text: "Export CSV…", disabled: true });
+    this.imageBtn = h("button", { type: "button", class: "image-btn", text: "Save as image…", disabled: true });
     this.bar = h("div", { class: "results-bar" },
       this.statusEl, this.noticeEl, h("span", { class: "spacer" }), this.pager,
+      exportable && onImage ? this.imageBtn : null,
       exportable ? this.exportBtn : null);
     this.body = h("div", { class: "grid-wrap", tabindex: "0" });
     clear(host).append(this.bar, this.body);
@@ -58,6 +61,7 @@ export class ResultsView {
     this.lastBtn.addEventListener("click", () =>
       this.goto(Math.floor(Math.max(0, this.total - 1) / this.pageSize) * this.pageSize));
     this.exportBtn.addEventListener("click", () => { if (this.onExport) this.onExport(this); });
+    this.imageBtn.addEventListener("click", () => { if (this.onImage) this.onImage(this); });
     this.body.addEventListener("keydown", (e) => this.onKey(e));
     this.body.addEventListener("mousedown", (e) => this.onMouseDown(e));
     this.body.addEventListener("click", (e) => this.onClick(e));
@@ -77,6 +81,7 @@ export class ResultsView {
     this.cells = [];
     this.widths = new Map();
     this.hasResult = false;
+    this.snapshotMeta = null;
     this.pager.hidden = true;
     this.updateExport();
   }
@@ -122,6 +127,17 @@ export class ResultsView {
     this.exportBtn.title = this.exportAllowed
       ? (this.hasResult ? "Export the rows of this result to a CSV file." : "Nothing to export yet.")
       : this.exportTooltip;
+    this.imageBtn.disabled = !(this.exportAllowed && this.hasResult);
+    this.imageBtn.title = this.exportAllowed
+      ? (this.hasResult ? "Save the SQL and the first 50 rows as a PNG image (Ctrl/Cmd+Shift+S)." : "Nothing to save yet.")
+      : this.exportTooltip;
+  }
+
+  // Rows in the current display order (client-side sort included) when the first page is
+  // loaded; null when another page is showing.
+  displayRows(limit) {
+    if (this.offset !== 0) return null;
+    return this.order.slice(0, limit).map((i) => this.rows[i]);
   }
 
   // result: {columns, rows, total_rows, offset}; fetchPage(offset, limit) → same shape

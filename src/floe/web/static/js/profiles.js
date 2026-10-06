@@ -53,7 +53,7 @@ export const FIELDS = [
   { name: "duckdb_memory_limit", label: "Memory limit", kind: "opt_str", group: DUCKDB, placeholder: "4GB (optional)" },
   { name: "duckdb_threads", label: "Threads", kind: "opt_int", group: DUCKDB, placeholder: "(optional)" },
   { name: "conn_cache_max", label: "Max cached connections", kind: "pos_int", group: DUCKDB },
-  { name: "allow_export", label: "Allow CSV export", kind: "bool", group: SAFETY },
+  { name: "allow_export", label: "Allow export", kind: "bool", group: SAFETY },
   { name: "preview_row_limit", label: "Preview row limit", kind: "pos_int", group: SAFETY },
   { name: "restrict_file_access", label: "Restrict file access", kind: "bool", group: SAFETY,
     hint: "Restrict DuckDB file access to this branch's containers. Turn off only if legitimate reads fail with 'Access denied'." },

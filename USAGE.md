@@ -443,9 +443,39 @@ Each step shows a pass/fail line with its message and elapsed time.
     Floe reloads and retries the query once automatically, with a
     non-blocking "Catalog changed — reloaded and retried" notice.
 - **Export CSV…** — appears on a results grid; does nothing unless the
-  active profile has **Allow CSV export** turned on (Safety settings).
+  active profile has **Allow export** turned on (Safety settings).
   Clicking it always confirms the row count and that the file is saved by
   your browser (Floe keeps no copy) before writing.
+#### Share a query result as an image
+
+1. Run a query on the **SQL** tab.
+2. Click **Save as image…** next to Export CSV… (or press Ctrl/Cmd+Shift+S).
+   It is enabled only when there is a finished result and the active profile
+   has **Allow export** turned on (Profiles… → Safety → Allow export).
+3. Read the confirmation (the image contains the SQL and up to 50 result rows)
+   and click **Continue**.
+4. Choose where to save it.
+
+The image is a light, print-friendly PNG: header (branch, time, row count,
+duration, tenant filter), the full SQL (up to 40 lines), the first 50 rows in
+the grid's current sort order, and a footer with the Floe version. Wide results
+show as many columns as fit and say how many were left out. It is drawn in your
+browser; nothing is sent to the Floe server and Floe keeps no copy. Profile
+secrets, storage account, container and paths are never included.
+
+File name: `floe_<view>_<YYYY-MM-DD>_<HHMM>.png`, where `<view>` is the first
+table view named in your SQL (else `query`), e.g.
+`floe_silver_input_layer_medical_claim_2026-10-06_1432.png`.
+
+Save dialog: Chrome, Edge and Brave show a "Save as" dialog. Firefox and Safari
+save straight to the download folder unless you enable "Always ask you where to
+save files" (Firefox: Settings → General → Downloads) or "Ask for each
+download" (Safari: Settings → General → File download location). Floe's status
+bar says which happened.
+
+Caution: the image contains real result data. Anyone you share it with can read
+it, so only share it where that is allowed.
+
 - **Keyboard shortcuts** (also under Help ▾ → Keyboard shortcuts):
 
   | Shortcut | Action |
@@ -454,6 +484,7 @@ Each step shows a pass/fail line with its message and elapsed time.
   | Esc | Cancel the running query |
   | Ctrl/Cmd+R | Refresh the catalog |
   | Ctrl/Cmd+F | Filter tables (outside the editor) |
+  | Ctrl/Cmd+Shift+S | Save the SQL result as an image |
   | Alt+1 / 2 / 3 | Preview / Schema / SQL tab |
   | Ctrl/Cmd+C | Copy selected cells as TSV (in a grid) |
   | Ctrl/Cmd+A | Select all cells (in a grid) |

@@ -212,3 +212,21 @@ def test_wheel_contains_templates_and_static(tmp_path):
         *(f"floe/web/static/vendor/codemirror/{p.name}" for p in VENDOR.iterdir()),
     }
     assert expected <= names, sorted(expected - names)
+
+
+def test_save_as_image_is_client_side_only(client):
+    """The SQL results bar gets a "Save as image…" button (built in grid.js), the Canvas
+    module is served under the unchanged CSP, and nothing in it talks to the server."""
+    assert (STATIC_DIR / "js" / "snapshot.js").is_file()
+    assert _served(client, "/static/js/snapshot.js").split(";")[0] in JS_TYPES
+    snap = (STATIC_DIR / "js" / "snapshot.js").read_text(encoding="utf-8")
+    assert "fetch(" not in snap and "XMLHttpRequest" not in snap and "console." not in snap
+    assert "html2canvas" not in snap
+    assert "showSaveFilePicker" in snap and "revokeObjectURL" in snap
+    grid = (STATIC_DIR / "js" / "grid.js").read_text(encoding="utf-8")
+    assert "Save as image…" in grid
+    app = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "onImage: saveSqlImage" in app and "Safety → Allow export" in app
+    assert "'unsafe-inline'" not in CSP and "blob:" not in CSP and "data:" not in CSP
+    index = client.get("/").text
+    assert "Shift</kbd>+<kbd>S" in index  # listed in the shortcuts help

@@ -307,7 +307,7 @@ This tool can display healthcare data. These rules are mandatory:
 - No result data is persisted to disk by default:
   - no result caching to disk;
   - query history (M6) stores SQL text only, never results.
-- CSV export is gated by the per-profile `allow_export` flag, which defaults to off. When exporting, show the row count and destination path before writing.
+- CSV export is gated by the per-profile `allow_export` flag, which defaults to off. When exporting, show the row count and destination path before writing. Image export (web "Save as image…") is gated by the same flag and confirms first that the image will contain the SQL and up to 50 result rows.
 - Logs contain metadata only: endpoints, status codes, timings, table keys, error types. They never contain row data or secrets.
 - Repository and fixtures contain **synthetic data only**. Never commit real data, real `.env` files, real container names, or real hostnames. No environment-specific name, host, IP, account, container or table key is hard-coded in the app; the user enters all of them in the profile. `.gitignore` must include `.env*`, `*.parquet` outside `tests/`, and `profiles.json`. The GitHub Python template ignores `*.spec`, so it must also contain `!packaging/*.spec` so the PyInstaller spec is committed.
 
@@ -476,6 +476,7 @@ The macOS Qt app is **frozen at v0.9.x**: its code stays in the repo and keeps p
 - Backend: FastAPI + uvicorn in a new `floe.web` package (no Qt imports). Frontend: server-rendered HTML + htmx + small vanilla JS, a SQL editor (CodeMirror) and a results grid. **All frontend assets are vendored in the package**: no CDN, no Node build step, works offline.
 - Feature parity with the Mac app: profiles (create, edit, duplicate, delete, import `.env`, Test connection, export / import of a profile as a settings-only JSON file), branch picker (inactive tenants greyed), table tree with status icons and view names, Preview, Schema, SQL (run, cancel, row limit, lazy registration, reload notice, tenant-filter offer), catalog status, export gate, SQL history, Copy diagnostics, About (version + commit).
 - Profile export / import: `GET /api/profiles/{name}/export` downloads `{format: "floe-profile", version: 1, …, profile}` with non-secret fields only (never secret keys or "saved" flags); `POST /api/profiles/import-profile {text}` strictly validates a file (≤ 256 KB, unknown fields dropped with a note, secret-named keys ignored with a warning) and returns `{fields, notes, missing_secrets}` without saving. The UI fills a new profile and flags the secrets the user must enter manually.
+- Save as image (SQL tab): "Save as image…" (Ctrl/Cmd+Shift+S) renders the SQL and the first 50 result rows to a PNG with Canvas 2D in the browser (`static/js/snapshot.js`), after a confirm dialog warning that the image contains data. Purely client-side: no endpoint, no logging; saved via the File System Access save dialog where available, else `<a download>`. File name `floe_<view|query>_<YYYY-MM-DD>_<HHMM>.png`. Gated by `allow_export` like CSV.
 - Long operations run in server-side worker threads; the browser polls or streams status. Cancel maps to the existing per-query `CancelToken`.
 
 ### 15.2 Persistence (survives restarts)

@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -858,4 +859,200 @@ def test_background_server_show_links_after_closing_all_tabs(browser, background
     expect(page.locator("body")).to_contain_text("link printed in the terminal")
     page.goto(second)
     expect(page.locator("body")).to_contain_text("floe show")
+    context.close()
+
+
+# --------------------------------------------------------------------------- save as image
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    assert data[12:16] == b"IHDR"
+    return struct.unpack(">II", data[16:24])
+
+
+def _run_range(page, n: int = 80) -> None:
+    _set_editor(page, f"SELECT range AS n, 'row ' || range AS label FROM range({n})")
+    page.click("#btn-run")
+    expect(page.locator("#sql-results .results-status")).to_contain_text(f"{n} rows")
+
+
+def _snapshot_profile(iceberg_fixtures, *, allow_export: bool) -> None:
+    fx = iceberg_fixtures
+    ProfileStore().save(
+        Profile(
+            name="e2e-image",
+            mode="local",
+            local_fixture_dir=str(fx.local_root),
+            shared_containers=list(SHARED_CONTAINERS),
+            shared_namespaces=list(SHARED_NAMESPACES),
+            tenant_registry_table=REGISTRY_KEY,
+            allow_export=allow_export,
+        )
+    )
+
+
+def test_save_as_image_gated_by_allow_export(browser, server, iceberg_fixtures):
+    _snapshot_profile(iceberg_fixtures, allow_export=False)
+    context, page, console = _new_page(browser)
+    _open(page, server["url"])
+    page.select_option("#branch-select", "eg-test1")
+    _run_range(page, 5)
+    button = page.locator("#sql-results .image-btn")
+    expect(button).to_have_text("Save as image…")
+    expect(button).to_be_disabled()
+    expect(button).to_have_attribute(
+        "title", "Export is disabled for this profile (Profiles… → Safety → Allow export)."
+    )
+    page.keyboard.press("ControlOrMeta+Shift+s")
+    expect(page.locator("#toast")).to_contain_text("Export is disabled")
+    expect(page.locator("#confirm-dialog")).not_to_be_visible()
+    console.assert_clean()
+    context.close()
+
+
+def test_save_as_image_download_fallback(browser, server, iceberg_fixtures, tmp_path):
+    _snapshot_profile(iceberg_fixtures, allow_export=True)
+    context, page, console = _new_page(browser)
+    _open(page, server["url"])
+    page.select_option("#branch-select", "eg-test1")
+    expect(page.locator(".tree-row.table[data-view='bronze_medical']")).to_be_visible()
+    page.evaluate("delete window.showSaveFilePicker")  # force the <a download> path
+    button = page.locator("#sql-results .image-btn")
+    expect(button).to_be_disabled()  # no result yet
+    _set_editor(page, "SELECT m.id, r.range AS n, NULL AS nothing, m.code "
+                      "FROM bronze_medical m CROSS JOIN range(30) r")
+    page.click("#btn-run")
+    expect(page.locator("#sql-results .results-status")).to_contain_text("rows")
+    total = page.locator("#sql-results .results-status").inner_text().split(" rows")[0]
+    expect(button).to_be_enabled()
+
+    # Cancel in the confirm dialog: nothing is downloaded.
+    downloads: list = []
+    page.on("download", lambda d: downloads.append(d))
+    button.click()
+    message = page.locator("#confirm-message")
+    expect(message).to_contain_text(
+        f"The image will contain the SQL and up to 50 result rows ({total} rows in result). "
+        "Anyone you share it with can read that data."
+    )
+    expect(page.locator("#confirm-ok")).to_have_text("Continue")
+    page.click("#confirm-cancel")
+    page.wait_for_timeout(500)
+    assert downloads == []
+
+    # Continue via the keyboard shortcut.
+    page.locator("#sql-results .grid-wrap").focus()
+    with page.expect_download() as info:
+        page.keyboard.press("ControlOrMeta+Shift+s")
+        page.click("#confirm-ok")
+    download = info.value
+    assert re.fullmatch(
+        r"floe_bronze_medical_\d{4}-\d{2}-\d{2}_\d{4}\.png", download.suggested_filename
+    ), download.suggested_filename
+    data = Path(download.path()).read_bytes()
+    width, height = _png_size(data)
+    assert 1400 <= width <= 4800 and 1200 <= height <= 4000  # 2x scale, 50 rows
+    expect(page.locator("#statusbar")).to_contain_text(
+        f"Saved image {download.suggested_filename}"
+    )
+    expect(page.locator("#statusbar")).to_contain_text("browser's download folder")
+    sample = os.environ.get("FLOE_E2E_SNAPSHOT")
+    if sample:
+        Path(sample).parent.mkdir(parents=True, exist_ok=True)
+        Path(sample).write_bytes(data)
+    console.assert_clean()
+    context.close()
+
+
+def test_save_as_image_file_picker_path_and_cancel(browser, server, iceberg_fixtures):
+    _snapshot_profile(iceberg_fixtures, allow_export=True)
+    context, page, console = _new_page(browser)
+    _open(page, server["url"])
+    page.select_option("#branch-select", "eg-test1")
+    page.evaluate(
+        """() => {
+          window.__saved = {name: null, blob: null, options: null, abort: false};
+          window.showSaveFilePicker = async (options) => {
+            window.__saved.options = options;
+            if (window.__saved.abort) throw new DOMException("cancelled", "AbortError");
+            return {
+              name: options.suggestedName,
+              createWritable: async () => ({
+                write: async (blob) => { window.__saved.blob = blob; },
+                close: async () => {},
+              }),
+            };
+          };
+        }"""
+    )
+    _run_range(page, 70)
+    page.click("#sql-results .image-btn")
+    page.click("#confirm-ok")
+    expect(page.locator("#statusbar")).to_contain_text("Saved image floe_query_")
+    info = page.evaluate(
+        "async () => ({options: window.__saved.options, type: window.__saved.blob.type,"
+        " bytes: Array.from(new Uint8Array(await window.__saved.blob.arrayBuffer()).slice(0, 24))})"
+    )
+    assert info["options"]["suggestedName"].startswith("floe_query_")
+    assert info["options"]["types"] == [
+        {"description": "PNG image", "accept": {"image/png": [".png"]}}
+    ]
+    assert info["type"] == "image/png"
+    width, height = _png_size(bytes(info["bytes"]))
+    assert width >= 1440 and height > 800
+
+    # The user cancels the file dialog: quiet, no error toast, no status message.
+    page.evaluate(
+        "window.__saved.abort = true; document.querySelector('#statusbar').textContent = ''"
+    )
+    page.click("#sql-results .image-btn")
+    page.click("#confirm-ok")
+    page.wait_for_timeout(500)
+    expect(page.locator("#statusbar")).to_have_text("")
+    expect(page.locator("#toast")).to_be_hidden()
+    console.assert_clean()
+    context.close()
+
+
+def test_snapshot_helpers(browser, server):
+    context, page, _console = _new_page(browser)
+    _open(page, server["url"])
+    out = page.evaluate(
+        """async () => {
+          const m = await import("/static/js/snapshot.js");
+          const ctx = document.createElement("canvas").getContext("2d");
+          ctx.font = "12px monospace";
+          const measure = (t) => ctx.measureText(t).width;
+          const now = new Date(2026, 9, 6, 14, 32);
+          const views = ["silver_input_layer_medical_claim", "bronze_medical", "gold"];
+          const long = "word ".repeat(300);
+          const wrapped = m.wrapLines("SELECT a,\\n  b FROM " + "x".repeat(200), 200, measure);
+          return {
+            full: m.snapshotFilename(
+              "select * from SILVER_input_layer_medical_claim c join bronze_medical b", views, now),
+            first: m.snapshotFilename("select * from bronze_medical join gold", views, now),
+            none: m.snapshotFilename("select 1", views, now),
+            partial: m.snapshotFilename("select * from gold_extra", views, now),
+            weird: m.snapshotFilename("x", [], now),
+            sanitize: m.sanitizeSubject("Hello-World! ../x", 32),
+            longName: m.snapshotFilename("select 1 from " + "a".repeat(60), ["a".repeat(60)], now),
+            fit: m.fitText("abcdefghijklmnopqrstuvwxyz".repeat(5), 80, measure),
+            fitShort: m.fitText("abc", 80, measure),
+            wrapWidths: wrapped.map(measure).every((w) => w <= 200.01),
+            wrapped: wrapped.length,
+            capped: m.wrapLines(long, 150, measure, 40),
+          };
+        }"""
+    )
+    assert out["full"] == "floe_silver_input_layer_medical_claim_2026-10-06_1432.png"
+    assert out["first"] == "floe_bronze_medical_2026-10-06_1432.png"
+    assert out["none"] == out["weird"] == "floe_query_2026-10-06_1432.png"
+    assert out["partial"] == "floe_query_2026-10-06_1432.png"
+    assert out["sanitize"] == "hello_world_x"
+    assert out["longName"] == "floe_" + "a" * 32 + "_2026-10-06_1432.png"
+    assert out["fit"].endswith("…") and len(out["fit"]) < 20
+    assert out["fitShort"] == "abc"
+    assert out["wrapWidths"] and out["wrapped"] > 3
+    assert len(out["capped"]) == 41 and out["capped"][-1] == "… (SQL truncated)"
     context.close()

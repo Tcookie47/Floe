@@ -108,6 +108,9 @@ or reinstall a newer release wheel with `pipx install --force <url>`.
 - **Export CSV…** is off by default; a profile needs `allow_export` enabled
   (Safety settings) before exporting does anything, and exporting always shows
   the row count and destination first.
+- **Save as image…** (SQL tab, Ctrl/Cmd+Shift+S) renders the SQL and the first
+  50 result rows to a PNG, entirely in the browser; gated by `allow_export`
+  like CSV export. See USAGE.md.
 - **Query history** stores SQL text only, per profile — never results — and can
   be cleared at any time.
 - **Diagnostics.** Copy diagnostics puts version, platform, the active

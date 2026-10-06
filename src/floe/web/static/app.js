@@ -9,6 +9,7 @@ import { TableTree } from "./js/tree.js";
 import { ProfilesDialog } from "./js/profiles.js";
 import { AskPanel } from "./js/ask.js";
 import { TIMELINE_CHANNELS, TimelineView } from "./js/timeline.js";
+import { MAX_ROWS, renderSnapshot, saveSnapshot, snapshotFilename } from "./js/snapshot.js";
 import { TextareaEditor } from "./js/fallback_editor.js";
 
 const PAGE_SIZE = 500;
@@ -22,7 +23,7 @@ const CATALOG = {
 };
 const TENANT_TIP = "Only show this branch's rows (WHERE data_source = <branch value>) in tenant tables.";
 const NOT_ON_MAIN = "Not applicable on the main branch";
-const EXPORT_OFF = "Export is disabled for this profile (Profiles… → Safety → Allow CSV export).";
+const EXPORT_OFF = "Export is disabled for this profile (Profiles… → Safety → Allow export).";
 
 const S = {
   profiles: [],
@@ -476,6 +477,10 @@ async function runSql() {
   if (done.status === "done") {
     const r = done.result;
     sqlView.jobId = job.id;
+    sqlView.snapshotMeta = {
+      sql, branch: S.ref, elapsed: r.query_elapsed ?? 0, truncated: Boolean(r.truncated),
+      tenantFilter: S.tenantApplicable ? tenantFilter : null,
+    };
     sqlView.showResult(r, (offset, pageLimit) => job.page(offset, pageLimit).then((j) => j.result));
     sqlView.setStatus(summary(r, { tenantFilter, limitLabel: "limit reached" }));
     sqlView.setNotice(r.reloaded ? "Catalog changed — reloaded and retried." : "");
@@ -557,6 +562,35 @@ async function exportCsv(view) {
   status(`Exported ${fmtInt(response.headers.get("x-row-count") || view.total)} rows.`, 5000);
 }
 
+// ----- save as image (client-side only; nothing is sent to the server) ---------------------
+let savingImage = false;
+async function saveSqlImage(view = sqlView) {
+  if (savingImage) return;
+  if (!S.profileData || !S.profileData.allow_export) { toast(EXPORT_OFF, 6000); return; }
+  if (!view.hasResult || !view.snapshotMeta) { toast("Run a query first."); return; }
+  const ok = await confirmDialog(
+    `The image will contain the SQL and up to ${MAX_ROWS} result rows (${fmtInt(view.total)} rows in result). `
+    + "Anyone you share it with can read that data.",
+    { title: "Save as image", ok: "Continue" });
+  if (!ok) return;
+  savingImage = true;
+  const meta = { ...view.snapshotMeta, now: new Date() };
+  const filename = snapshotFilename(meta.sql, tree ? tree.tables.map((t) => t.view_name) : [], meta.now);
+  try {
+    const result = await saveSnapshot(filename, async () => {
+      let rows = view.displayRows(MAX_ROWS);
+      if (!rows) rows = (await view.fetchPage(0, MAX_ROWS)).rows; // another page is showing
+      return renderSnapshot({ columns: view.columns, rows, total: view.total }, meta);
+    });
+    if (result.method === "picker") status(`Saved image ${result.name}`, 6000);
+    else if (result.method === "download") status(`Saved image ${result.name} — saved to your browser's download folder`, 8000);
+  } catch (err) {
+    toast(`Couldn't save the image: ${err && err.message ? err.message : "unknown error"}`, 6000);
+  } finally {
+    savingImage = false;
+  }
+}
+
 // ----- help menu ----------------------------------------------------------------------------
 function closeHelp() {
   $("#help-menu").hidden = true;
@@ -603,6 +637,11 @@ function onKeyDown(e) {
   if (mod && e.key === "Enter") {
     e.preventDefault();
     if (S.tab === "sql" || inEditor(e.target)) runSql();
+    return;
+  }
+  if (mod && e.shiftKey && !e.altKey && (e.key === "s" || e.key === "S")) {
+    e.preventDefault();
+    if (S.tab === "sql") saveSqlImage(sqlView);
     return;
   }
   if (mod && !e.shiftKey && !e.altKey && (e.key === "r" || e.key === "R")) {
@@ -731,7 +770,7 @@ async function main() {
   const defaults = JSON.parse(document.body.dataset.profileDefaults || "{}");
   previewView = new ResultsView($("#preview-results"), { pageSize: PAGE_SIZE, onExport: exportCsv });
   schemaView = new ResultsView($("#schema-results"), { paged: false, exportable: false });
-  sqlView = new ResultsView($("#sql-results"), { pageSize: PAGE_SIZE, onExport: exportCsv });
+  sqlView = new ResultsView($("#sql-results"), { pageSize: PAGE_SIZE, onExport: exportCsv, onImage: saveSqlImage });
   tree = new TableTree($("#tree"), $("#tree-message"), $("#tree-filter"), {
     onSelect: onTableSelected, onActivate: onTableActivated,
     menuItems: [{ label: "Show history", action: showTableHistory }],
