@@ -3,7 +3,7 @@
 // show "(saved)" when a value exists; typing sets a new value, Clear removes it on Save.
 
 import { api, authHeaders, enc, errorText, JobHandle } from "./api.js";
-import { $, clear, confirmDialog, h, toast } from "./dom.js";
+import { $, clear, confirmDialog, fmtInt, h, toast } from "./dom.js";
 
 const GENERAL = "General";
 const STORAGE = "Storage (ADLS)";
@@ -54,7 +54,10 @@ export const FIELDS = [
   { name: "duckdb_threads", label: "Threads", kind: "opt_int", group: DUCKDB, placeholder: "(optional)" },
   { name: "conn_cache_max", label: "Max cached connections", kind: "pos_int", group: DUCKDB },
   { name: "allow_export", label: "Allow export", kind: "bool", group: SAFETY },
-  { name: "preview_row_limit", label: "Preview row limit", kind: "pos_int", group: SAFETY },
+  // Stored as `preview_row_limit` (compatible with saved/exported profiles); it is the
+  // number of rows per Preview page. Bounds match floe.core.profiles.INT_BOUNDS.
+  { name: "preview_row_limit", label: "Preview page size", kind: "pos_int", group: SAFETY, min: 50, max: 5000,
+    hint: "Rows per Preview page (50–5,000). Preview loads one page at a time from the server." },
   { name: "restrict_file_access", label: "Restrict file access", kind: "bool", group: SAFETY,
     hint: "Restrict DuckDB file access to this branch's containers. Turn off only if legitimate reads fail with 'Access denied'." },
 ];
@@ -148,7 +151,8 @@ export class ProfilesDialog {
           const numeric = ["int", "opt_int", "pos_int"].includes(f.kind);
           input = h("input", {
             type: numeric ? "number" : "text", id, name: f.name, placeholder: f.placeholder || null,
-            min: numeric ? (f.kind === "int" ? "0" : "1") : null, step: numeric ? "1" : null, spellcheck: "false",
+            min: numeric ? String(f.min ?? (f.kind === "int" ? 0 : 1)) : null,
+            max: numeric && f.max ? String(f.max) : null, step: numeric ? "1" : null, spellcheck: "false",
           });
           control = input;
         }
@@ -277,8 +281,12 @@ export class ProfilesDialog {
         default: {
           const text = raw.trim();
           if (f.kind === "opt_int" && text === "") { out[f.name] = null; break; }
-          const min = f.kind === "int" ? 0 : 1;
-          if (!/^\d+$/.test(text) || Number(text) < min) { fail(f.name, `Enter a whole number ≥ ${min}.`); break; }
+          const min = f.min ?? (f.kind === "int" ? 0 : 1);
+          const ok = /^\d+$/.test(text) && Number(text) >= min && !(f.max && Number(text) > f.max);
+          if (!ok) {
+            fail(f.name, f.max ? `Enter a whole number from ${fmtInt(min)} to ${fmtInt(f.max)}.` : `Enter a whole number ≥ ${fmtInt(min)}.`);
+            break;
+          }
           out[f.name] = Number(text);
         }
       }

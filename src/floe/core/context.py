@@ -21,9 +21,21 @@ Main entry point for the UI: `FloeSession(profile, secrets, nessie_client=None)`
 - Each query holds its connection's (re-entrant) lock from view resolution through
   execution, so concurrent queries with different tenant-filter modes can't swap a view
   underneath each other.
-- Cancellation: pass a `CancelToken` as `cancel_token=` to `query` / `preview` / `schema` /
-  `register` / `resolve_sql_references` and call `token.cancel()` from any thread.
-  `interrupt(ref)` / `interrupt_all()` cancel every active query of a ref / of the session.
+- Cancellation: pass a `CancelToken` as `cancel_token=` to `query` / `preview` /
+  `preview_page` / `count_rows` / `schema` / `register` / `resolve_sql_references` and call
+  `token.cancel()` from any thread. `interrupt(ref)` / `interrupt_all()` cancel every
+  active query of a ref / of the session.
+- Preview paging (SPEC §8.5): `preview_page` reads one page with
+  `SELECT * FROM "<view>" LIMIT size+1 OFFSET k` (the extra row detects "has more").
+  Page order is the scan order, which DuckDB keeps stable with `preserve_insertion_order`
+  (on by default; never changed by Floe): files in listing / manifest order, rows in file
+  order, a filter view only drops rows. Consecutive pages are therefore disjoint and
+  complete for one data version (tests page through multi-file iceberg_scan and
+  read_parquet tables, filtered and not, and compare with a full read). Each page reports
+  the table's data version; a later page requested with an older version returns
+  `version_changed` instead of rows. Totals: exact from the current snapshot summary
+  (`total-records`) when no row filter applies, else from a `count_rows` result cached per
+  data version, else unknown.
 
 No Qt here. No secret or row data is ever logged.
 """
@@ -149,6 +161,52 @@ class QueryResult:
     @property
     def row_count(self) -> int:
         return len(self.df)
+
+
+TotalSource = Literal["snapshot", "count", "end"]
+
+
+@dataclass
+class PreviewPage:
+    """One Preview page (`FloeSession.preview_page`). Holds at most `page_size` rows."""
+
+    df: pd.DataFrame
+    offset: int
+    page_size: int
+    has_more: bool
+    elapsed: float  # seconds
+    reloaded: bool
+    data_version: str  # opaque; pass back as `expect_version` for the following pages
+    filtered: bool  # a row filter (the tenant filter) applies to this view
+    version_changed: bool = False  # `expect_version` no longer current: no rows returned
+    total_rows: int | None = None  # exact table total when known
+    total_source: TotalSource | None = None  # snapshot summary / counted / end reached
+
+    @property
+    def row_count(self) -> int:
+        return len(self.df)
+
+    @property
+    def truncated(self) -> bool:
+        return self.has_more
+
+
+@dataclass(frozen=True)
+class RowCount:
+    count: int
+    data_version: str
+    elapsed: float
+    reloaded: bool
+
+
+@dataclass(frozen=True)
+class _ViewRun:
+    value: object
+    ctx: Context
+    info: TableInfo
+    filtered: bool
+    version: str
+    changed: bool
 
 
 @dataclass(frozen=True)
@@ -539,6 +597,9 @@ class Context:
         self.collisions: dict[str, tuple[TableInfo, ...]] = {}
         # Containers DuckDB may read on this connection (None = no file-access restriction).
         self.allowed_containers: frozenset[str] | None = None
+        # Single-threaded sibling connection for Preview pages of Iceberg views (created
+        # lazily, dropped together with this context; see FloeSession._pager_context).
+        self.pager: Context | None = None
 
     @property
     def ref(self) -> str:
@@ -802,6 +863,9 @@ class FloeSession:
         self._registry: dict[str, RegistryEntry] | None = None
         self._registry_version: str | None = None  # main head the registry was loaded at
         self._registry_failed: tuple[str, float] | None = None  # (main head, clock) of failure
+        # (ref, view, filtered, data version) -> exact row count (Count rows / end reached)
+        self._counts_lock = threading.Lock()
+        self._counts: OrderedDict[tuple[str, str, bool, str], int] = OrderedDict()
 
     # ----- properties ------------------------------------------------------
     @property
@@ -977,7 +1041,51 @@ class FloeSession:
         log.info("Connection for %s restricted to containers %s", ctx.ref, containers)
 
     def _new_connection(self) -> duckdb.DuckDBPyConnection:
-        conn = duckdb.connect(":memory:")
+        """A configured (not yet restricted) connection."""
+        return self._setup_connection(duckdb.connect(":memory:"))
+
+    def _new_pager_connection(self) -> duckdb.DuckDBPyConnection:
+        """Like `_new_connection`, but single-threaded (deterministic Iceberg scan order)."""
+        conn = self._new_connection()
+        try:
+            conn.execute("SET threads = 1")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def _pager_context(self, ctx: Context) -> Context:
+        """The single-threaded sibling of `ctx` used for Preview pages (remote mode).
+
+        DuckDB's `iceberg_scan` does not keep scan order across threads (the same
+        `LIMIT n OFFSET k` can return different rows with threads > 1), whereas a
+        single-threaded scan reads the data files in manifest order, row groups in file
+        order: deterministic for one metadata.json, and still streaming (page 1 reads
+        only the first row groups). The sibling has the same setup and file-access
+        restriction, its own views, and shares `ctx`'s catalog listing and table statuses.
+        It is dropped together with `ctx` (cache eviction, invalidation).
+        """
+        pager = ctx.pager
+        if pager is not None:
+            return pager
+        with self._build_lock:
+            if ctx.pager is not None:
+                return ctx.pager
+            conn = self._new_pager_connection()
+            pager = Context(ctx.key, conn)
+            pager.tables = ctx.tables
+            pager.collisions = ctx.collisions
+            pager._status = ctx._status  # one status map: list_tables reads ctx's
+            try:
+                self._restrict_file_access(pager)
+            except BaseException:
+                conn.close()
+                raise
+            ctx.pager = pager
+            log.info("Built single-threaded preview connection for %s", ctx.key.short())
+            return pager
+
+    def _setup_connection(self, conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
         try:
             if self.is_local:
                 p = self._profile
@@ -1569,14 +1677,260 @@ class FloeSession:
         *,
         cancel_token: CancelToken | None = None,
     ) -> QueryResult:
-        """First `preview_row_limit` rows of a view."""
-        return self.query(
-            ref,
-            f"SELECT * FROM {quote_identifier(view_name)}",
-            limit=self._profile.preview_row_limit,
-            tenant_filter=tenant_filter,
-            cancel_token=cancel_token,
+        """The first Preview page of a view (`truncated` = more rows exist)."""
+        page = self.preview_page(
+            ref, view_name, 0, tenant_filter=tenant_filter, cancel_token=cancel_token
         )
+        return QueryResult(
+            df=page.df, truncated=page.has_more, elapsed=page.elapsed, reloaded=page.reloaded
+        )
+
+    # ----- preview paging (SPEC §8.5) ----------------------------------------
+    @property
+    def preview_page_size(self) -> int:
+        return self._profile.preview_page_size
+
+    def _data_version(self, key: ConnectionKey, info: TableInfo, filtered: bool) -> str:
+        """The data version a view's rows depend on (opaque, non-secret).
+
+        Shared tables and the main ref follow the main head; a tenant table follows its
+        branch head, plus the main head when filtered (the `data_source` value can come
+        from the tenant registry on main). Local mode has no versions.
+        """
+        if key.mode == "local":
+            return "local"
+        if info.shared or key.ref == self.main_ref:
+            return f"m:{key.main_head}"
+        if filtered:
+            return f"b:{key.ref_head}+m:{key.main_head}"
+        return f"b:{key.ref_head}"
+
+    def data_version(self, ref: str, view_name: str, tenant_filter: bool = True) -> str:
+        """Current data version of a catalog view on `ref` (may do Nessie I/O)."""
+        ctx = self.context(ref)
+        info = self._catalog_info(ctx, ref, view_name)
+        return self._data_version(ctx.key, info, self._filtered(ctx.ref, info, tenant_filter))
+
+    def _filtered(self, ref: str, info: TableInfo, tenant_filter: bool) -> bool:
+        return bool(tenant_filter) and self.is_tenant_ref(ref) and not info.shared
+
+    def _catalog_info(self, ctx: Context, ref: str, view_name: str) -> TableInfo:
+        tables = self._ensure_catalog(ctx)
+        info = tables.get(view_name)
+        if info is not None:
+            return info
+        if view_name in ctx.collisions:
+            raise self._collision_error(view_name, ctx.collisions[view_name])
+        raise TableNotFound(ref, view_name)
+
+    def _view_run(
+        self,
+        ref: str,
+        view_name: str,
+        tenant_filter: bool,
+        token: CancelToken,
+        body: Callable[[Context, TableInfo, bool, str], T],
+        expect_version: str | None = None,
+        *,
+        pager: bool = False,
+    ) -> tuple[_ViewRun, bool]:
+        """Register catalog view `view_name` and run `body` under the connection's lock.
+
+        If `expect_version` is given and the view's data version moved, `body` doesn't
+        run (`changed=True`). A missing metadata.json is rebuilt and retried once, and the
+        version is checked again on the fresh connection. `pager=True` runs on the ref's
+        single-threaded preview connection (remote mode; see `_pager_context`).
+        """
+
+        def run(ctx: Context) -> _ViewRun:
+            info = self._catalog_info(ctx, ref, view_name)
+            filtered = self._filtered(ctx.ref, info, tenant_filter)
+            version = self._data_version(ctx.key, info, filtered)
+            if expect_version is not None and version != expect_version:
+                return _ViewRun(None, ctx, info, filtered, version, True)
+            target = self._pager_context(ctx) if pager and not self.is_local else ctx
+
+            def locked() -> T:
+                self._enforce_filter_mode(target, tenant_filter, token)
+                self._register_in(target, info, tenant_filter, token)
+                return body(target, info, filtered, version)
+
+            value = self._locked(target, token, locked)
+            return _ViewRun(value, ctx, info, filtered, version, False)
+
+        with self._activity(ref, token):
+            return self._with_rebuild(ref, run)
+
+    def _count_key(
+        self, ref: str, view_name: str, filtered: bool, version: str
+    ) -> tuple[str, str, bool, str]:
+        return (ref, view_name, filtered, version)
+
+    def _remember_count(self, key: tuple[str, str, bool, str], count: int) -> None:
+        with self._counts_lock:
+            self._counts[key] = int(count)
+            self._counts.move_to_end(key)
+            while len(self._counts) > 512:
+                self._counts.popitem(last=False)
+
+    def cached_count(
+        self, ref: str, view_name: str, filtered: bool, version: str
+    ) -> int | None:
+        """A row count known for exactly this data version (Count rows / end reached)."""
+        with self._counts_lock:
+            return self._counts.get(self._count_key(ref, view_name, filtered, version))
+
+    def _snapshot_total(self, ctx: Context, info: TableInfo, token: CancelToken) -> int | None:
+        """`total-records` of the table's current snapshot (remote only), else None.
+
+        Reads only the table's current metadata.json (cached by location), through the
+        same restricted connection as the page. Any failure just means "unknown".
+        """
+        if self.is_local or self._nessie is None:
+            return None
+        from floe.core import timeline  # imported lazily: timeline imports this module
+
+        try:
+            location = self._nessie.pointer(info.source_ref, info.key).metadata_location
+            container = container_of(location, local_root=self._local_storage_root)
+            self._check_container(ctx.ref, info, container, shared=info.shared)
+            history = timeline.load_history(
+                location,
+                lambda: self._read_metadata_file(ctx, info, location, token),
+                info.dotted,
+            )
+        except QueryCancelled:
+            raise
+        except FloeError as exc:
+            log.info("Snapshot total of %s unavailable (%s)", info.dotted, type(exc).__name__)
+            return None
+        return timeline.current_row_total(history)
+
+    def preview_page(
+        self,
+        ref: str,
+        view_name: str,
+        offset: int = 0,
+        tenant_filter: bool = True,
+        *,
+        page_size: int | None = None,
+        expect_version: str | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> PreviewPage:
+        """One Preview page: rows `offset` .. `offset + page_size - 1` of a catalog view.
+
+        Runs `SELECT * FROM "<view>" LIMIT page_size + 1 OFFSET offset` (the extra row
+        only detects `has_more`; at most `page_size` rows are returned). `page_size`
+        defaults to the profile's `preview_page_size`. With `expect_version` (the
+        `data_version` of page 1), a moved data version returns `version_changed=True`
+        and no rows, so the caller can restart at page 1. `total_rows` is exact when known:
+        the end was reached, the current snapshot summary's `total-records` when no row
+        filter applies, or a cached `count_rows` result for this data version.
+        """
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a whole number >= 0")
+        size = int(page_size) if page_size is not None else self.preview_page_size
+        if size < 1:
+            raise ValueError("page_size must be >= 1")
+        token = cancel_token if cancel_token is not None else CancelToken()
+        sql = (
+            f"SELECT * FROM {quote_identifier(view_name)} "
+            f"LIMIT {size + 1} OFFSET {int(offset)}"
+        )
+        start = time.perf_counter()
+
+        def body(ctx: Context, info: TableInfo, filtered: bool, version: str) -> pd.DataFrame:
+            return self._execute_df(ctx, sql, token)
+
+        try:
+            run, reloaded = self._view_run(
+                ref, view_name, tenant_filter, token, body, expect_version, pager=True
+            )
+        except FloeError as exc:
+            log.info(
+                "Preview page on %s failed after %.0f ms: %s",
+                ref,
+                (time.perf_counter() - start) * 1000,
+                type(exc).__name__,
+            )
+            raise
+        elapsed = time.perf_counter() - start
+        if run.changed:
+            log.info("Preview of %s on %s: data version changed since page 1", view_name, ref)
+            return PreviewPage(
+                df=pd.DataFrame(),
+                offset=offset,
+                page_size=size,
+                has_more=False,
+                elapsed=elapsed,
+                reloaded=reloaded,
+                data_version=run.version,
+                filtered=run.filtered,
+                version_changed=True,
+            )
+        df = run.value
+        assert isinstance(df, pd.DataFrame)
+        has_more = len(df) > size
+        if has_more:
+            df = df.iloc[:size].reset_index(drop=True)
+        count_key = self._count_key(ref, view_name, run.filtered, run.version)
+        total: int | None = None
+        source: TotalSource | None = None
+        if not has_more and (len(df) > 0 or offset == 0):
+            total, source = offset + len(df), "end"
+            self._remember_count(count_key, total)
+        else:
+            total = self.cached_count(ref, view_name, run.filtered, run.version)
+            source = "count" if total is not None else None
+            if total is None and not run.filtered:
+                with self._activity(ref, token):
+                    total = self._snapshot_total(run.ctx, run.info, token)
+                source = "snapshot" if total is not None else None
+        token.raise_if_cancelled()
+        log.info(
+            "Preview page on %s: offset %d, %d rows in %.0f ms%s%s",
+            ref,
+            offset,
+            len(df),
+            elapsed * 1000,
+            " (more)" if has_more else "",
+            " (reloaded)" if reloaded else "",
+        )
+        return PreviewPage(
+            df=df,
+            offset=offset,
+            page_size=size,
+            has_more=has_more,
+            elapsed=elapsed,
+            reloaded=reloaded,
+            data_version=run.version,
+            filtered=run.filtered,
+            total_rows=total,
+            total_source=source,
+        )
+
+    def count_rows(
+        self,
+        ref: str,
+        view_name: str,
+        tenant_filter: bool = True,
+        *,
+        cancel_token: CancelToken | None = None,
+    ) -> RowCount:
+        """`SELECT count(*)` of a catalog view; cached for its data version."""
+        token = cancel_token if cancel_token is not None else CancelToken()
+        sql = f"SELECT count(*) AS n FROM {quote_identifier(view_name)}"
+        start = time.perf_counter()
+
+        def body(ctx: Context, info: TableInfo, filtered: bool, version: str) -> int:
+            return int(self._execute_df(ctx, sql, token).iloc[0, 0])
+
+        run, reloaded = self._view_run(ref, view_name, tenant_filter, token, body)
+        count = int(run.value)  # type: ignore[arg-type]
+        self._remember_count(self._count_key(ref, view_name, run.filtered, run.version), count)
+        elapsed = time.perf_counter() - start
+        log.info("Counted rows of a view on %s in %.0f ms", ref, elapsed * 1000)
+        return RowCount(count=count, data_version=run.version, elapsed=elapsed, reloaded=reloaded)
 
     def schema(
         self,

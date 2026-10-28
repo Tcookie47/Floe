@@ -8,6 +8,11 @@ Preview / schema / query / test-connection / ask / Timeline (freshness, history,
 table_history) work runs as jobs (`floe.web.jobs`):
 `POST /api/jobs` returns an id at once, the browser polls `GET /api/jobs/{id}` and can
 `POST /api/jobs/{id}/cancel`. Result rows are served a page at a time from memory.
+
+Preview is paged on the server (SPEC §8.5): each `preview` job reads one page
+(`offset`, the profile's page size) and holds at most that many rows; later pages pass
+the page-1 `data_version` as `expect_version` and get `version_changed` instead of rows
+if the branch moved. A `preview_count` job runs `SELECT count(*)` for the exact total.
 """
 
 from __future__ import annotations
@@ -22,7 +27,14 @@ from fastapi.responses import StreamingResponse
 
 from floe import __commit__, __version__
 from floe.core import diagnostics
-from floe.core.context import ColumnInfo, FloeSession, QueryResult, TableInfo
+from floe.core.context import (
+    ColumnInfo,
+    FloeSession,
+    PreviewPage,
+    QueryResult,
+    RowCount,
+    TableInfo,
+)
 from floe.core.export import ExportNotAllowed
 from floe.web import api_ask, api_profiles, api_timeline
 from floe.web.jobs import CANCELLED, DONE, ERROR, Job, JobNotFound
@@ -39,9 +51,11 @@ MAX_QUERY_LIMIT = 1_000_000
 DEFAULT_PAGE = 500
 MAX_PAGE = 5_000
 MAX_SQL = 1_000_000
+MAX_OFFSET = 10**15
 CSV_CHUNK_ROWS = 2_000
 DEFAULT_CHANNELS = {
     "preview": "preview",
+    "preview_count": "preview_count",
     "schema": "schema",
     "query": "sql",
     "test_connection": "test_connection",
@@ -201,15 +215,44 @@ def _start_job(state: WebState, payload: dict[str, Any]) -> Job:
 
     if kind == "preview":
         view = _view(payload)
-        meta["view_name"] = view
-        meta["row_limit"] = profile.preview_row_limit
+        offset = payload.get("offset", 0)
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or not 0 <= offset <= MAX_OFFSET
+        ):
+            raise _bad("offset must be a whole number >= 0.")
+        expect_version = payload.get("expect_version")
+        if expect_version is not None and (
+            not isinstance(expect_version, str) or not 0 < len(expect_version) <= 200
+        ):
+            raise _bad("expect_version must be a short string or null.")
+        page_size = profile.preview_page_size
+        meta.update(view_name=view, row_limit=page_size, page_offset=offset)
 
-        def run_preview(cancel_token) -> QueryResult:
-            return sessions.get(name).preview(
-                ref, view, tenant_filter=tenant_filter, cancel_token=cancel_token
+        def run_preview(cancel_token) -> PreviewPage:
+            return sessions.get(name).preview_page(
+                ref,
+                view,
+                offset,
+                tenant_filter=tenant_filter,
+                page_size=page_size,
+                expect_version=expect_version,
+                cancel_token=cancel_token,
             )
 
         return state.jobs.submit(kind, run_preview, profile=name, channel=channel, meta=meta)
+
+    if kind == "preview_count":
+        view = _view(payload)
+        meta["view_name"] = view
+
+        def run_count(cancel_token) -> RowCount:
+            return sessions.get(name).count_rows(
+                ref, view, tenant_filter=tenant_filter, cancel_token=cancel_token
+            )
+
+        return state.jobs.submit(kind, run_count, profile=name, channel=channel, meta=meta)
 
     if kind == "schema":
         view = _view(payload)
@@ -250,6 +293,33 @@ def _start_job(state: WebState, payload: dict[str, Any]) -> Job:
 
 def _result_payload(job: Job, offset: int, limit: int) -> Any:
     result = job.result
+    if isinstance(result, PreviewPage):
+        df = result.df
+        return {
+            "columns": frame_columns(df),
+            "rows": frame_rows(df, offset, limit),
+            "offset": offset,
+            "limit": limit,
+            "total_rows": len(df),  # rows held by this job (one page)
+            "truncated": result.has_more,
+            "reloaded": result.reloaded,
+            "query_elapsed": result.elapsed,
+            "page_offset": result.offset,
+            "page_size": result.page_size,
+            "has_more": result.has_more,
+            "table_total": result.total_rows,
+            "total_source": result.total_source,
+            "data_version": result.data_version,
+            "version_changed": result.version_changed,
+            "filtered": result.filtered,
+        }
+    if isinstance(result, RowCount):
+        return {
+            "count": result.count,
+            "data_version": result.data_version,
+            "query_elapsed": result.elapsed,
+            "reloaded": result.reloaded,
+        }
     if isinstance(result, QueryResult):
         df = result.df
         return {
@@ -281,7 +351,7 @@ def job_payload(job: Job, offset: int = 0, limit: int = DEFAULT_PAGE) -> dict[st
         "elapsed": round(job.elapsed, 3),
         "cancel_requested": job.cancel_requested,
         **{k: v for k, v in job.meta.items() if k in ("ref", "view_name", "tenant_filter",
-                                                        "row_limit", "key")},
+                                                        "row_limit", "key", "page_offset")},
     }
     if job.kind == "test_connection":
         out["steps"] = list(job.progress)
@@ -353,8 +423,9 @@ def cancel_channels(
 def download_csv(job_id: str, state: State) -> StreamingResponse:
     """The finished preview/query result as CSV — exactly the rows that were shown.
 
-    Allowed only when the job's profile currently has `allow_export` on (SPEC §9); the
-    browser shows the row count before offering the link.
+    For a preview job that is the one page it read (rows a–b of the table). Allowed only
+    when the job's profile currently has `allow_export` on (SPEC §9); the browser shows
+    the row count before offering the link.
     """
     job = _job(state, job_id)
     if job.kind not in ("preview", "query") or job.status != DONE:
@@ -375,6 +446,9 @@ def download_csv(job_id: str, state: State) -> StreamingResponse:
             yield part.to_csv(index=False, header=start == 0).encode("utf-8")
 
     stem = job.meta.get("view_name") or "query"
+    if isinstance(job.result, PreviewPage) and len(df):
+        first = job.result.offset + 1
+        stem = f"{stem}_rows_{first}-{first + len(df) - 1}"
     return StreamingResponse(
         chunks(),
         media_type="text/csv; charset=utf-8",

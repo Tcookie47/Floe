@@ -1,6 +1,14 @@
 // Results view: a status bar (status line, notices, pager, Export CSV) over a data grid
 // with a sticky header, client-side sort of the loaded page, resizable columns, dimmed
 // NULLs, rectangular cell selection and Ctrl/Cmd+C copy as TSV.
+//
+// Two paging modes:
+// - client paging (SQL tab): the whole result lives in one server job; `fetchPage(offset,
+//   limit)` reads slices of it and the total is always known.
+// - server paging (`serverPaged`, Preview tab): every page is its own server job. The
+//   owner sets `onPageRequest(offset)` (loads that page, then calls `showPage`); the total
+//   may be unknown ("of N+"), in which case Last is disabled and `onCount` offers
+//   "Count rows".
 
 import { $$, clear, copyText, fmtInt, h, toast } from "./dom.js";
 
@@ -28,11 +36,18 @@ function compare(a, b) {
 }
 
 export class ResultsView {
-  constructor(host, { pageSize = 500, paged = true, exportable = true, onExport = null, onImage = null } = {}) {
+  constructor(host, {
+    pageSize = 500, paged = true, exportable = true, onExport = null, onImage = null,
+    serverPaged = false, sortHint = null, onCount = null,
+  } = {}) {
     this.host = host;
     this.onImage = onImage;
     this.pageSize = pageSize;
     this.paged = paged;
+    this.serverPaged = serverPaged;
+    this.sortHint = sortHint;
+    this.onCount = onCount;
+    this.onPageRequest = null;
     this.onExport = onExport;
     this.exportAllowed = false;
     this.exportTooltip = "";
@@ -46,10 +61,15 @@ export class ResultsView {
     this.lastBtn = h("button", { type: "button", title: "Last page", "aria-label": "Last page", text: "⏭" });
     this.pager = h("span", { class: "pager", hidden: true },
       this.firstBtn, this.prevBtn, this.pageLabel, this.nextBtn, this.lastBtn);
+    this.countBtn = h("button", {
+      type: "button", class: "count-btn", text: "Count rows", hidden: true,
+      title: "Count the rows of this table (runs SELECT count(*)); enables Last.",
+    });
     this.exportBtn = h("button", { type: "button", class: "export-btn", text: "Export CSV…", disabled: true });
     this.imageBtn = h("button", { type: "button", class: "image-btn", text: "Save as image…", disabled: true });
     this.bar = h("div", { class: "results-bar" },
-      this.statusEl, this.noticeEl, h("span", { class: "spacer" }), this.pager,
+      this.statusEl, this.noticeEl, h("span", { class: "spacer" }),
+      onCount ? this.countBtn : null, this.pager,
       exportable && onImage ? this.imageBtn : null,
       exportable ? this.exportBtn : null);
     this.body = h("div", { class: "grid-wrap", tabindex: "0" });
@@ -58,8 +78,8 @@ export class ResultsView {
     this.firstBtn.addEventListener("click", () => this.goto(0));
     this.prevBtn.addEventListener("click", () => this.goto(this.offset - this.pageSize));
     this.nextBtn.addEventListener("click", () => this.goto(this.offset + this.pageSize));
-    this.lastBtn.addEventListener("click", () =>
-      this.goto(Math.floor(Math.max(0, this.total - 1) / this.pageSize) * this.pageSize));
+    this.lastBtn.addEventListener("click", () => this.goto(this.lastOffset()));
+    this.countBtn.addEventListener("click", () => { if (this.onCount) this.onCount(this); });
     this.exportBtn.addEventListener("click", () => { if (this.onExport) this.onExport(this); });
     this.imageBtn.addEventListener("click", () => { if (this.onImage) this.onImage(this); });
     this.body.addEventListener("keydown", (e) => this.onKey(e));
@@ -82,7 +102,12 @@ export class ResultsView {
     this.widths = new Map();
     this.hasResult = false;
     this.snapshotMeta = null;
+    this.hasMore = false;
+    this.tableTotal = null; // server paging: exact table total, or null when unknown
+    this.counting = false;
+    this.busy = false;
     this.pager.hidden = true;
+    this.countBtn.hidden = true;
     this.updateExport();
   }
 
@@ -134,10 +159,47 @@ export class ResultsView {
   }
 
   // Rows in the current display order (client-side sort included) when the first page is
-  // loaded; null when another page is showing.
+  // loaded (server paging: the current page); null when another page is showing.
   displayRows(limit) {
-    if (this.offset !== 0) return null;
+    if (this.offset !== 0 && !this.serverPaged) return null;
     return this.order.slice(0, limit).map((i) => this.rows[i]);
+  }
+
+  // Server paging: "rows 501–1,000" of the page that is showing.
+  pageRange() {
+    const first = this.rows.length ? this.offset + 1 : this.offset;
+    return `${fmtInt(first)}–${fmtInt(this.offset + this.rows.length)}`;
+  }
+
+  // Server paging: "of 2,400" when the total is known, else "of 1,000+".
+  totalText() {
+    if (this.tableTotal !== null && this.tableTotal !== undefined) return `of ${fmtInt(this.tableTotal)}`;
+    return `of ${fmtInt(this.offset + this.rows.length)}${this.hasMore ? "+" : ""}`;
+  }
+
+  lastOffset() {
+    const total = this.serverPaged ? this.tableTotal : this.total;
+    return Math.floor(Math.max(0, (total ?? 1) - 1) / this.pageSize) * this.pageSize;
+  }
+
+  // Server paging: show one page. page: {columns, rows, page_offset, page_size, has_more,
+  // table_total (null when unknown)}.
+  showPage(page) {
+    this.pageSize = page.page_size || this.pageSize;
+    this.hasMore = Boolean(page.has_more);
+    this.tableTotal = page.table_total ?? null;
+    this.showResult({ columns: page.columns, rows: page.rows, total_rows: page.rows.length, offset: page.page_offset });
+    this.body.scrollTop = 0;
+  }
+
+  setTableTotal(total) {
+    this.tableTotal = total ?? null;
+    this.updatePager();
+  }
+
+  setCounting(counting) {
+    this.counting = counting;
+    this.updatePager();
   }
 
   // result: {columns, rows, total_rows, offset}; fetchPage(offset, limit) → same shape
@@ -160,6 +222,19 @@ export class ResultsView {
   }
 
   async goto(offset) {
+    if (this.serverPaged) {
+      if (!this.onPageRequest || this.busy) return;
+      offset = Math.max(0, offset);
+      if (this.tableTotal !== null) offset = Math.min(offset, this.lastOffset());
+      if (offset === this.offset) return;
+      this.setBusy(true);
+      try {
+        await this.onPageRequest(offset);
+      } finally {
+        this.setBusy(false);
+      }
+      return;
+    }
     if (!this.fetchPage) return;
     const maxOffset = Math.floor(Math.max(0, this.total - 1) / this.pageSize) * this.pageSize;
     offset = Math.max(0, Math.min(offset, maxOffset));
@@ -181,11 +256,14 @@ export class ResultsView {
   }
 
   setBusy(busy) {
+    this.busy = busy;
     for (const b of [this.firstBtn, this.prevBtn, this.nextBtn, this.lastBtn]) b.disabled = busy;
+    this.pager.setAttribute("aria-busy", String(busy));
     if (!busy) this.updatePager();
   }
 
   updatePager() {
+    if (this.serverPaged) { this.updateServerPager(); return; }
     const multi = this.paged && this.total > this.pageSize;
     this.pager.hidden = !multi;
     if (!multi) return;
@@ -193,6 +271,22 @@ export class ResultsView {
     this.pageLabel.textContent = `${fmtInt(this.offset + 1)}–${fmtInt(end)} of ${fmtInt(this.total)}`;
     this.firstBtn.disabled = this.prevBtn.disabled = this.offset === 0;
     this.nextBtn.disabled = this.lastBtn.disabled = end >= this.total;
+  }
+
+  updateServerPager() {
+    const known = this.tableTotal !== null && this.tableTotal !== undefined;
+    const multi = this.paged && this.hasResult && (this.offset > 0 || this.hasMore);
+    this.pager.hidden = !multi;
+    this.countBtn.hidden = !(this.onCount && this.hasResult && !known && this.hasMore);
+    this.countBtn.textContent = this.counting ? "Counting… (click to cancel)" : "Count rows";
+    this.countBtn.classList.toggle("busy", this.counting);
+    if (!multi) return;
+    this.pageLabel.textContent = `${this.pageRange()} ${this.totalText()}`;
+    if (this.busy) return;
+    this.firstBtn.disabled = this.prevBtn.disabled = this.offset === 0;
+    this.nextBtn.disabled = !this.hasMore;
+    this.lastBtn.disabled = !known || this.offset >= this.lastOffset();
+    this.lastBtn.title = known ? "Last page" : "Last page (count the rows first)";
   }
 
   // ----- sort ----------------------------------------------------------------
@@ -247,8 +341,11 @@ export class ResultsView {
     const headRow = h("tr", {}, h("th", { class: "rownum", text: "#" }));
     this.columns.forEach((col, i) => {
       const sorted = this.sort && this.sort.col === i ? ` sort-${this.sort.dir}` : "";
+      const tip = this.sortHint
+        ? `${col.name} (${col.type}) — click to sort. ${this.sortHint}`
+        : `${col.name} (${col.type}) — click to sort this page`;
       headRow.append(h("th", {
-        class: `col-head${sorted}`, dataset: { col: String(i) }, title: `${col.name} (${col.type}) — click to sort this page`,
+        class: `col-head${sorted}`, dataset: { col: String(i) }, title: tip,
         scope: "col",
       },
       h("span", { class: "cname", text: col.name }),

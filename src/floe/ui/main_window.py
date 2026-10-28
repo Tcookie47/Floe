@@ -734,7 +734,7 @@ class MainWindow(QMainWindow):
     def _summary(self, result: QueryResult, tenant_filter: bool, table: TableInfo) -> str:
         parts = [f"{result.row_count:,} rows", f"{result.elapsed:.2f} s"]
         if result.truncated:
-            limit = self._session.profile.preview_row_limit if self._session else result.row_count
+            limit = self._session.profile.preview_page_size if self._session else result.row_count
             parts.append(f"truncated to the preview limit ({limit:,} rows)")
         if self._ref is not None and self._session is not None:
             filterable = self._session.is_tenant_ref(self._ref) and not table.shared

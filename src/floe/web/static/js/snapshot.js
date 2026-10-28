@@ -103,7 +103,8 @@ function version() {
   return meta ? meta.content : "";
 }
 
-// meta: {sql, branch, elapsed, truncated, tenantFilter (true/false, or null when n/a), now}
+// meta: {sql, branch, elapsed, truncated, tenantFilter (true/false, or null when n/a), now,
+//        rowsLabel (optional, replaces "N rows", e.g. "Rows 501–1,000 of 2,400" for a preview page)}
 // result: {columns: [{name, type}], rows (display order, already limited), total}
 export function renderSnapshot({ columns, rows, total }, meta) {
   const probe = document.createElement("canvas").getContext("2d");
@@ -166,7 +167,7 @@ export function renderSnapshot({ columns, rows, total }, meta) {
   const fw = ctx.measureText("Floe").width;
   const where = [meta.branch, `${date} ${time}`].filter(Boolean).join("  ·  ");
   text(where, PAD + fw + 14, yHeader + 13, `13px ${SANS}`, C.muted);
-  const stats = [`${fmtInt(total)} rows`, `${Number(meta.elapsed ?? 0).toFixed(2)} s`];
+  const stats = [meta.rowsLabel || `${fmtInt(total)} rows`, `${Number(meta.elapsed ?? 0).toFixed(2)} s`];
   if (meta.truncated) stats.push("truncated at limit");
   if (meta.tenantFilter === true) stats.push("tenant filter on");
   if (meta.tenantFilter === false) stats.push("tenant filter off");

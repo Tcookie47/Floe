@@ -131,7 +131,7 @@ floe/
 | `conn_cache_max` | int | no | `16` | |
 | **Safety** | | | | |
 | `allow_export` | bool | no | `false` | Gates CSV export for this profile (see §9) |
-| `preview_row_limit` | int | no | `1000` | |
+| `preview_row_limit` | int | no | `500` | **Preview page size**: rows per Preview page, 50–5,000 (validated on save; values imported from older profile files are clamped with a note; larger values saved by older versions are clamped to 5,000 at use time). The field name is kept for compatibility with saved and exported profiles. |
 
 ### 4.3 Import from `.env`
 
@@ -267,7 +267,7 @@ All user-facing error text passes through the redaction filter (§10).
   - A filter box above the tree
   - Status icons for not-found and corrupt-pointer tables
 - **Main area**, with three tabs:
-  - **Preview:** first `preview_row_limit` rows of the selected table.
+  - **Preview:** the selected table, one page (`preview_row_limit` rows) at a time, loaded lazily from the server (§8.5).
   - **Schema:** column name, type, nullable.
   - **SQL:** editor (monospace, Cmd+Enter to run), Run and Cancel buttons, results grid below.
 - **Status bar:** elapsed time, row count, truncation notice when results hit the limit.
@@ -293,8 +293,15 @@ Run the steps in order, with a pass/fail line each and a clear message on the fi
 - A `QAbstractTableModel` backed by a DataFrame.
 - Supports sorting, column resize, and copying selected cells as TSV.
 - Default limits:
-  - Preview uses `preview_row_limit`.
+  - Preview is paged on the server: one page of `preview_row_limit` rows (the **Preview page size**, default 500, 50–5,000) at a time.
   - SQL results are capped at 10,000 rows, with a status-bar notice when truncated and a per-query override field.
+- **Preview paging** (web app; `FloeSession.preview_page` / `count_rows`):
+  - Each page is `SELECT * FROM "<view>" LIMIT n+1 OFFSET k` (the extra row only detects "has more"; a page holds at most `n` rows). The first page loads on table select; Next / Prev / First / Last each load their page from the server as a cancellable job on the `preview` channel, so a new table or branch cancels in-flight page loads.
+  - **Order stability.** Pages follow the scan order, so consecutive pages must be disjoint and complete for one data version. `read_parquet` (local mode) keeps file/row order under DuckDB's default `preserve_insertion_order = true`, also with several threads. `iceberg_scan` does **not**: with threads > 1 the same `LIMIT/OFFSET` returned different rows. Deterministic fallback: Iceberg preview pages run on a single-threaded sibling connection per data version (same setup and file-access restriction, created lazily, dropped with its connection), where the scan reads data files in manifest order and rows in file order, and still streams (page 1 reads only the first row groups). SQL and Count rows keep the parallel connection. Tests page through multi-file, multi-snapshot tables (filter on/off, a shared table from main, both modes) and compare the concatenated pages with a single full read and an `ORDER BY` read.
+  - **Data-version pinning.** Page 1 records the view's data version (shared tables / main: the main head; a tenant table: its branch head, plus the main head when filtered; local mode: constant). Later pages send it back; if the head moved the job returns `version_changed` instead of rows and the UI shows "This branch changed since you started browsing — back to page 1" and reloads page 1. Reload-and-retry on a missing metadata.json (§6.4) still applies.
+  - **Totals.** Exact when known: the end was reached on some page; or no row filter applies (tenant filter off / not applicable: main ref, shared tables) and the current snapshot summary has `total-records` without row-level deletes (`total-position-deletes` / `total-equality-deletes` > 0 make it unknown) — read from the table's metadata.json only; or a **Count rows** result (`SELECT count(*)` as a cancellable `preview_count` job, cached per session and data version). Otherwise the pager shows "of N+" and **Last** is disabled. Counting never blocks page 1. Last = `OFFSET floor((total-1)/n)*n`.
+  - Client-side column sort applies to the current page only (header tooltip: "Sorts this page only — use SQL ORDER BY to sort the whole table"). Status bar: "Rows a–b of N" or "of N+", plus the page's elapsed time.
+  - Export CSV and Save as image in Preview cover the current page ("this page (rows a–b)"). The SQL tab keeps its result-set paging.
 
 ---
 
@@ -476,7 +483,8 @@ The macOS Qt app is **frozen at v0.9.x**: its code stays in the repo and keeps p
 - Backend: FastAPI + uvicorn in a new `floe.web` package (no Qt imports). Frontend: server-rendered HTML + htmx + small vanilla JS, a SQL editor (CodeMirror) and a results grid. **All frontend assets are vendored in the package**: no CDN, no Node build step, works offline.
 - Feature parity with the Mac app: profiles (create, edit, duplicate, delete, import `.env`, Test connection, export / import of a profile as a settings-only JSON file), branch picker (inactive tenants greyed), table tree with status icons and view names, Preview, Schema, SQL (run, cancel, row limit, lazy registration, reload notice, tenant-filter offer), catalog status, export gate, SQL history, Copy diagnostics, About (version + commit).
 - Profile export / import: `GET /api/profiles/{name}/export` downloads `{format: "floe-profile", version: 1, …, profile}` with non-secret fields only (never secret keys or "saved" flags); `POST /api/profiles/import-profile {text}` strictly validates a file (≤ 256 KB, unknown fields dropped with a note, secret-named keys ignored with a warning) and returns `{fields, notes, missing_secrets}` without saving. The UI fills a new profile and flags the secrets the user must enter manually.
-- Save as image (SQL tab): "Save as image…" (Ctrl/Cmd+Shift+S) renders the SQL and the first 50 result rows to a PNG with Canvas 2D in the browser (`static/js/snapshot.js`), after a confirm dialog warning that the image contains data. Purely client-side: no endpoint, no logging; saved via the File System Access save dialog where available, else `<a download>`. File name `floe_<view|query>_<YYYY-MM-DD>_<HHMM>.png`. Gated by `allow_export` like CSV.
+- Preview pages through the table on the server (§8.5): one job per page (≤ `preview_row_limit` rows, 50–5,000, default 500), data-version pinned, exact totals from the snapshot summary or **Count rows**, and Export CSV / Save as image of the current page.
+- Save as image (SQL tab, and Preview for the current page): "Save as image…" (Ctrl/Cmd+Shift+S) renders the SQL and the first 50 result rows to a PNG with Canvas 2D in the browser (`static/js/snapshot.js`), after a confirm dialog warning that the image contains data. Purely client-side: no endpoint, no logging; saved via the File System Access save dialog where available, else `<a download>`. File name `floe_<view|query>_<YYYY-MM-DD>_<HHMM>.png`. Gated by `allow_export` like CSV.
 - Long operations run in server-side worker threads; the browser polls or streams status. Cancel maps to the existing per-query `CancelToken`.
 
 ### 15.2 Persistence (survives restarts)

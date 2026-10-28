@@ -37,7 +37,8 @@ def test_round_trip_defaults(tmp_path):
     assert loaded.nessie_main_ref == "main"
     assert loaded.nessie_head_ttl_seconds == 45
     assert loaded.conn_cache_max == 16
-    assert loaded.preview_row_limit == 1000
+    assert loaded.preview_row_limit == 500
+    assert loaded.preview_page_size == 500
     assert loaded.allow_export is False
     assert loaded.shared_containers == []
     assert loaded.shared_namespaces == []
@@ -414,8 +415,11 @@ def test_parse_env_file_ignores_comments_and_blank_lines(tmp_path):
 # --------------------------------------------------------------------------- profile files
 
 from floe.core.profiles import (  # noqa: E402
-    IMPORT_FIELD_KINDS,
+    FIELD_KINDS,
+    INT_BOUNDS,
     MAX_EXPORT_BYTES,
+    PREVIEW_PAGE_MAX,
+    PREVIEW_PAGE_MIN,
     ProfileImportError,
     export_profile,
     parse_profile_export,
@@ -443,10 +447,39 @@ def _file(**profile_overrides) -> dict:
     return data
 
 
-def test_import_field_kinds_cover_profile_fields():
+def test_field_kinds_cover_profile_fields_and_are_the_single_source_of_truth():
     import dataclasses
+    import inspect
 
-    assert set(IMPORT_FIELD_KINDS) == {f.name for f in dataclasses.fields(Profile)}
+    from floe.web import api_profiles
+
+    assert set(FIELD_KINDS) == {f.name for f in dataclasses.fields(Profile)}
+    # The web API validates with the very same tables (no second copy to drift).
+    assert api_profiles.FIELD_KINDS is FIELD_KINDS
+    assert api_profiles.INT_BOUNDS is INT_BOUNDS
+    source = inspect.getsource(api_profiles)
+    assert '"nessie_head_ttl_seconds": "int"' not in source
+    assert INT_BOUNDS["preview_row_limit"] == (PREVIEW_PAGE_MIN, PREVIEW_PAGE_MAX) == (50, 5000)
+
+
+@pytest.mark.parametrize(
+    ("stored", "used"),
+    [(500, 500), (50, 50), (5000, 5000), (1000, 1000), (5001, 5000), (1_000_000, 5000)],
+)
+def test_preview_page_size_clamps_old_values_at_use_time(stored, used):
+    profile = Profile(name="eg-test1", preview_row_limit=stored)
+    assert profile.preview_page_size == used
+    assert profile.preview_row_limit == stored  # the saved value itself is untouched
+
+
+def test_import_clamps_old_preview_limits_with_a_note():
+    result = parse_profile_export(json.dumps(_file(preview_row_limit=1_000_000)))
+    assert result.fields["preview_row_limit"] == 5000
+    assert any("preview_row_limit" in n and "5,000" in n for n in result.notes)
+    result = parse_profile_export(json.dumps(_file(preview_row_limit=10)))
+    assert result.fields["preview_row_limit"] == 50
+    result = parse_profile_export(json.dumps(_file(preview_row_limit=1000)))
+    assert result.fields["preview_row_limit"] == 1000 and result.notes == []
 
 
 def test_export_round_trip(tmp_path):

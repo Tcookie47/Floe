@@ -109,6 +109,10 @@ def test_profile_validation(client):
     assert post({**REMOTE, "mode": "cloud"}).status_code == 400
     assert post({**REMOTE, "preview_row_limit": "10"}).status_code == 400
     assert post({**REMOTE, "preview_row_limit": 0}).status_code == 400
+    # Preview page size: 50..5,000 rows per page.
+    for bad in (49, 5001, 1_000_000):
+        r = post({**REMOTE, "name": f"ps-{bad}", "preview_row_limit": bad})
+        assert r.status_code == 400 and "50 to 5,000" in r.json()["error"]["message"]
     assert post({**REMOTE, "allow_export": "yes"}).status_code == 400
     assert post({**REMOTE, "shared_containers": "ref-a"}).status_code == 400
     assert post({**REMOTE, "name": ""}).status_code == 400
@@ -192,7 +196,9 @@ def test_test_connection_local(local_client, fx):
     # Also through /api/jobs, and for unsaved form values ("profile" is the name there).
     r = local_client.post("/api/jobs", json={"kind": "test_connection", "profile": "unsaved"})
     assert r.status_code == 404  # no saved profile and no form
-    form = local_profile(fx, name="unsaved", local_fixture_dir=str(fx.root / "missing"))
+    form = local_profile(
+        fx, name="unsaved", local_fixture_dir=str(fx.root / "missing"), preview_row_limit=500
+    )
     r = local_client.post(
         "/api/jobs",
         json={"kind": "test_connection", "profile": "unsaved", "profile_form": form.to_dict()},
@@ -324,7 +330,7 @@ def test_saving_a_profile_drops_its_session(local_client, fx):
     state = local_client.app.state.floe
     assert local_client.get("/api/profiles/local-p/branches").status_code == 200
     assert state.sessions.peek("local-p") is not None
-    profile = local_profile(fx).to_dict()
+    profile = local_profile(fx, preview_row_limit=500).to_dict()
     r = local_client.put("/api/profiles/local-p", json={"profile": profile})
     assert r.status_code == 200
     assert state.sessions.peek("local-p") is None

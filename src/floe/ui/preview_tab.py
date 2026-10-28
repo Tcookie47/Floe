@@ -1,4 +1,4 @@
-"""Preview tab (SPEC §8.1): the first `preview_row_limit` rows of the selected table."""
+"""Preview tab (SPEC §8.1): the first page (`preview_page_size` rows) of the selected table."""
 
 from __future__ import annotations
 

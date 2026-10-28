@@ -13,8 +13,11 @@ import { MAX_ROWS, renderSnapshot, saveSnapshot, snapshotFilename } from "./js/s
 import { TextareaEditor } from "./js/fallback_editor.js";
 
 const PAGE_SIZE = 500;
+const MAX_PREVIEW_PAGE = 5000; // largest Preview page size (profile field bound)
 const TABS = ["preview", "schema", "sql", "timeline"];
-const WORK_CHANNELS = ["preview", "schema", "sql", "ask", ...TIMELINE_CHANNELS];
+const WORK_CHANNELS = ["preview", "preview_count", "schema", "sql", "ask", ...TIMELINE_CHANNELS];
+const BRANCH_CHANGED = "This branch changed since you started browsing — back to page 1";
+const SORT_HINT = "Sorts this page only — use SQL ORDER BY to sort the whole table.";
 const CATALOG = {
   ok: ["Catalog OK", "Nessie answered the last request."],
   stale: ["Catalog unreachable, showing last known state", "The last head refresh failed; Floe is using the last known head."],
@@ -37,6 +40,8 @@ const S = {
   overrides: new Set(), // `${ref}\0${key}`: tenant filter off for this table's preview
   schemaCache: new Map(), // view → [column names] (editor completion)
   previewJob: null,
+  preview: null, // the table being browsed: {table, tenantFilter, version, shown}
+  previewCount: null, // running "Count rows" job
   schemaJob: null,
   sqlJob: null,
   sqlOverrideOnce: false,
@@ -183,6 +188,8 @@ async function loadProfiles() {
 function resetWorkspace(message) {
   abandon(S.previewJob); abandon(S.schemaJob);
   S.previewJob = S.schemaJob = null;
+  S.preview = null;
+  cancelPreviewCount();
   S.selected = null;
   S.schemaCache.clear();
   $("#preview-title").textContent = "Select a table in the tree.";
@@ -330,8 +337,8 @@ function runTableWork() {
   const table = S.selected;
   if (!table || !S.profile || !S.ref) return;
   const tenantFilter = tenantFilterFor(table);
-  const limit = S.profileData ? S.profileData.preview_row_limit : 1000;
-  tableTitle($("#preview-title"), "Preview", table, ` · first ${fmtInt(limit)} rows`);
+  const size = S.profileData ? Math.max(1, Math.min(MAX_PREVIEW_PAGE, S.profileData.preview_row_limit)) : PAGE_SIZE;
+  tableTitle($("#preview-title"), "Preview", table, ` · ${fmtInt(size)} rows per page`);
   tableTitle($("#schema-title"), "Schema", table, "");
   runPreview(table, tenantFilter);
   runSchema(table, tenantFilter);
@@ -354,34 +361,133 @@ function tableError(view, table, job, rerun) {
   view.showError(err.message, actions);
 }
 
+// Preview is paged on the server: every page is a cancellable job on the "preview"
+// channel (a new table / branch supersedes it). Page 1 pins the data version; a later page
+// that finds the branch moved comes back with `version_changed` and page 1 is reloaded.
+function cancelPreviewCount() {
+  const job = S.previewCount;
+  S.previewCount = null;
+  if (job) { job.abandon(); job.cancel(); }
+  if (previewView) previewView.setCounting(false);
+}
+
+function previewStatus(r) {
+  const P = S.preview;
+  const parts = [`Rows ${previewView.pageRange()} ${previewView.totalText()}`, fmtSecs(r.query_elapsed ?? 0)];
+  if (P && S.tenantApplicable && !P.table.shared && !P.tenantFilter) parts.push("tenant filter off");
+  return parts.join(" · ");
+}
+
+function previewSnapshotMeta(r) {
+  const P = S.preview;
+  return {
+    sql: `SELECT * FROM ${P.table.view_name} LIMIT ${r.page_size} OFFSET ${r.page_offset}`,
+    branch: S.ref, elapsed: r.query_elapsed ?? 0, truncated: false,
+    tenantFilter: S.tenantApplicable && !P.table.shared ? P.tenantFilter : null,
+    rowsLabel: `Rows ${previewView.pageRange()} ${previewView.totalText()}`,
+  };
+}
+
 async function runPreview(table, tenantFilter) {
   abandon(S.previewJob);
+  S.previewJob = null;
+  cancelPreviewCount();
+  S.preview = { table, tenantFilter, version: null, shown: false };
   previewView.showMessage(`Loading preview of ${table.view_name}…`, { loading: true });
   previewView.setStatus("");
+  await loadPreviewPage(0);
+}
+
+async function loadPreviewPage(offset, { notice = "" } = {}) {
+  const P = S.preview;
+  if (!P) return;
+  const { table, tenantFilter } = P;
+  abandon(S.previewJob);
+  if (P.shown) previewView.setStatus(`Loading rows from ${fmtInt(offset + 1)}…`);
   let job;
   try {
     job = await JobHandle.start({
       kind: "preview", channel: "preview", profile: S.profile, ref: S.ref,
-      view_name: table.view_name, tenant_filter: tenantFilter,
+      view_name: table.view_name, tenant_filter: tenantFilter, offset,
+      expect_version: P.version,
     });
-  } catch (err) { previewView.showError(errorText(err)); return; }
+  } catch (err) {
+    if (S.preview !== P) return;
+    if (P.shown) { toast(`Couldn't load that page: ${errorText(err)}`, 6000); previewView.updatePager(); } else previewView.showError(errorText(err));
+    return;
+  }
+  if (S.preview !== P) { job.cancel(); return; }
   S.previewJob = job;
-  const done = await job.wait({ pageSize: PAGE_SIZE }).catch((err) => ({ status: "error", error: { message: errorText(err) } }));
-  if (S.previewJob !== job || done.abandoned) return;
+  const done = await job.wait({ pageSize: MAX_PREVIEW_PAGE }).catch((err) => ({ status: "error", error: { message: errorText(err) } }));
+  if (S.previewJob !== job || done.abandoned || S.preview !== P) return;
   S.previewJob = null;
   if (done.status === "done") {
     const r = done.result;
+    if (r.version_changed) {
+      // The branch moved since page 1: start over on the new data version.
+      P.version = null;
+      cancelPreviewCount();
+      status(BRANCH_CHANGED, 8000);
+      await loadPreviewPage(0, { notice: BRANCH_CHANGED });
+      return;
+    }
+    P.version = r.data_version;
+    P.shown = true;
     previewView.jobId = job.id;
-    previewView.showResult(r, (offset, limit) => job.page(offset, limit).then((j) => j.result));
-    previewView.setStatus(summary(r, { tenantFilter, table, limitLabel: "preview row limit" }));
-    previewView.setNotice(r.reloaded ? "Catalog changed — reloaded and retried." : "");
+    previewView.showPage(r);
+    previewView.snapshotMeta = previewSnapshotMeta(r);
+    previewView.lastResult = r;
+    previewView.setStatus(previewStatus(r));
+    previewView.setNotice(notice || (r.reloaded ? "Catalog changed — reloaded and retried." : ""));
     if (table.status !== "registered" && table.status !== "unknown") tree.updateStatus(table.key, "registered", null);
-    refreshCatalogStatus();
+    if (offset === 0) refreshCatalogStatus();
   } else if (done.status === "cancelled") {
-    previewView.showMessage("Preview cancelled.");
+    if (P.shown) { previewView.setStatus("Page load cancelled."); previewView.updatePager(); } else previewView.showMessage("Preview cancelled.");
+  } else if (P.shown) {
+    toast(`Couldn't load that page: ${(done.error || {}).message || "failed"}`, 6000);
+    previewView.updatePager();
+    refreshCatalogStatus();
   } else {
     tableError(previewView, table, done, runTableWork);
     refreshCatalogStatus();
+  }
+}
+
+async function countPreviewRows() {
+  const P = S.preview;
+  if (!P || !P.version) return;
+  if (S.previewCount) { cancelPreviewCount(); return; } // the button doubles as Cancel
+  let job;
+  try {
+    job = await JobHandle.start({
+      kind: "preview_count", channel: "preview_count", profile: S.profile, ref: S.ref,
+      view_name: P.table.view_name, tenant_filter: P.tenantFilter,
+    });
+  } catch (err) { toast(`Couldn't count the rows: ${errorText(err)}`, 6000); return; }
+  if (S.preview !== P) { job.cancel(); return; }
+  S.previewCount = job;
+  previewView.setCounting(true);
+  const done = await job.wait().catch((err) => ({ status: "error", error: { message: errorText(err) } }));
+  if (S.previewCount !== job || done.abandoned || S.preview !== P) return;
+  S.previewCount = null;
+  previewView.setCounting(false);
+  if (done.status === "done") {
+    const r = done.result;
+    if (r.data_version !== P.version) {
+      // Counted a newer version than the rows on screen: restart on it (count is cached).
+      P.version = null;
+      status(BRANCH_CHANGED, 8000);
+      await loadPreviewPage(0, { notice: BRANCH_CHANGED });
+      return;
+    }
+    previewView.setTableTotal(r.count);
+    if (previewView.lastResult) {
+      previewView.setStatus(previewStatus(previewView.lastResult));
+      previewView.snapshotMeta = previewSnapshotMeta(previewView.lastResult);
+    }
+    status(`${P.table.view_name}: ${fmtInt(r.count)} rows (${fmtSecs(r.query_elapsed ?? 0)}).`, 6000);
+  } else if (done.status === "error") {
+    toast(`Couldn't count the rows: ${(done.error || {}).message || "failed"}`, 6000);
   }
 }
 
@@ -535,8 +641,11 @@ async function refreshHistory() {
 // ----- export -----------------------------------------------------------------------------
 async function exportCsv(view) {
   if (!view.jobId || !S.profileData || !S.profileData.allow_export) return;
+  const what = view.serverPaged
+    ? `this page (rows ${view.pageRange()})`
+    : `${fmtInt(view.total)} row(s)`;
   const ok = await confirmDialog(
-    `Export ${fmtInt(view.total)} row(s) to a CSV file? The file is saved by your browser; Floe doesn't keep a copy.`,
+    `Export ${what} to a CSV file? The file is saved by your browser; Floe doesn't keep a copy.`,
     { title: "Export CSV", ok: "Export" });
   if (!ok) return;
   let response;
@@ -559,7 +668,9 @@ async function exportCsv(view) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-  status(`Exported ${fmtInt(response.headers.get("x-row-count") || view.total)} rows.`, 5000);
+  status(view.serverPaged
+    ? `Exported rows ${view.pageRange()}.`
+    : `Exported ${fmtInt(response.headers.get("x-row-count") || view.total)} rows.`, 5000);
 }
 
 // ----- save as image (client-side only; nothing is sent to the server) ---------------------
@@ -567,10 +678,12 @@ let savingImage = false;
 async function saveSqlImage(view = sqlView) {
   if (savingImage) return;
   if (!S.profileData || !S.profileData.allow_export) { toast(EXPORT_OFF, 6000); return; }
-  if (!view.hasResult || !view.snapshotMeta) { toast("Run a query first."); return; }
+  if (!view.hasResult || !view.snapshotMeta) { toast(view.serverPaged ? "Preview a table first." : "Run a query first."); return; }
+  const contents = view.serverPaged
+    ? `up to ${MAX_ROWS} rows of this page (rows ${view.pageRange()})`
+    : `the SQL and up to ${MAX_ROWS} result rows (${fmtInt(view.total)} rows in result)`;
   const ok = await confirmDialog(
-    `The image will contain the SQL and up to ${MAX_ROWS} result rows (${fmtInt(view.total)} rows in result). `
-    + "Anyone you share it with can read that data.",
+    `The image will contain ${contents}. Anyone you share it with can read that data.`,
     { title: "Save as image", ok: "Continue" });
   if (!ok) return;
   savingImage = true;
@@ -642,6 +755,7 @@ function onKeyDown(e) {
   if (mod && e.shiftKey && !e.altKey && (e.key === "s" || e.key === "S")) {
     e.preventDefault();
     if (S.tab === "sql") saveSqlImage(sqlView);
+    else if (S.tab === "preview") saveSqlImage(previewView);
     return;
   }
   if (mod && !e.shiftKey && !e.altKey && (e.key === "r" || e.key === "R")) {
@@ -667,7 +781,7 @@ function onKeyDown(e) {
       const job = S.previewJob;
       S.previewJob = null;
       job.cancel();
-      previewView.showMessage("Preview cancelled.");
+      if (S.preview && S.preview.shown) { previewView.setStatus("Page load cancelled."); previewView.setBusy(false); } else previewView.showMessage("Preview cancelled.");
     }
   }
 }
@@ -768,7 +882,11 @@ async function main() {
     return;
   }
   const defaults = JSON.parse(document.body.dataset.profileDefaults || "{}");
-  previewView = new ResultsView($("#preview-results"), { pageSize: PAGE_SIZE, onExport: exportCsv });
+  previewView = new ResultsView($("#preview-results"), {
+    pageSize: PAGE_SIZE, onExport: exportCsv, onImage: saveSqlImage,
+    serverPaged: true, sortHint: SORT_HINT, onCount: () => countPreviewRows(),
+  });
+  previewView.onPageRequest = (offset) => loadPreviewPage(offset);
   schemaView = new ResultsView($("#schema-results"), { paged: false, exportable: false });
   sqlView = new ResultsView($("#sql-results"), { pageSize: PAGE_SIZE, onExport: exportCsv, onImage: saveSqlImage });
   tree = new TableTree($("#tree"), $("#tree-message"), $("#tree-filter"), {

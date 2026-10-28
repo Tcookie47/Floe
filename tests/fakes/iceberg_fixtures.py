@@ -271,3 +271,98 @@ def extension_unavailable_reason(*names: str) -> str | None:
     finally:
         con.close()
     return None  # pragma: no cover
+
+
+# --------------------------------------------------------------------------- paging tables
+
+PAGING_KEY = "silver.paging.events"  # tenant table on eg-test1 (has data_source)
+PAGING_SHARED_KEY = "gold_ref.paging_codes"  # shared table on main (container ref-a)
+PAGING_BATCHES = (700, 650, 600, 450)  # rows per append: one data file / snapshot each
+PAGING_TOTAL = sum(PAGING_BATCHES)
+PAGING_ROW_GROUP = 128  # small row groups: several per data file
+
+
+def paging_rows(start: int, n: int, own: str, other: str = "eg-test2") -> pa.Table:
+    """Rows `start` .. `start + n - 1`; every 4th row belongs to `other`."""
+    ids = list(range(start, start + n))
+    return pa.table(
+        {
+            "id": pa.array(ids, pa.int64()),
+            "label": pa.array([f"row-{i:05d}" for i in ids], pa.string()),
+            "data_source": pa.array([other if i % 4 == 3 else own for i in ids], pa.string()),
+        }
+    )
+
+
+def paging_own_ids(own: str = "eg-test1") -> list[int]:
+    return [i for i in range(PAGING_TOTAL) if i % 4 != 3]
+
+
+@dataclass
+class PagingTables:
+    """Multi-file / multi-snapshot tables for Preview paging tests.
+
+    Iceberg (remote mode, add to a FakeNessie with `seed_paging_tables`): the tenant table
+    `PAGING_KEY` (container eg-test1) and the shared `PAGING_SHARED_KEY` (container
+    ref-a), each written as `len(PAGING_BATCHES)` appends with small row groups.
+    Local mode: `local_root/<container>/<key path>/part-<n>.parquet`, one file per batch
+    (a separate root, so the shared local fixtures keep their table counts)."""
+
+    tenant_location: str
+    tenant_snapshot: int
+    shared_location: str
+    shared_snapshot: int
+    local_root: Path
+
+
+def build_paging_tables(base_dir: str | Path, iceberg_root: str | Path) -> PagingTables:
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    base = Path(base_dir)
+    iceberg_root = Path(iceberg_root)
+    cat = SqlCatalog(
+        "fx_paging",
+        uri=f"sqlite:///{base / 'catalog-paging.db'}",
+        warehouse=fixture_location(iceberg_root / "_warehouse"),
+    )
+    local_root = base / "local-paging"
+    out: dict[str, tuple[str, int]] = {}
+    for key, container in ((PAGING_KEY, "eg-test1"), (PAGING_SHARED_KEY, "ref-a")):
+        elements = key.split(".")
+        cat.create_namespace_if_not_exists(tuple(elements[:-1]))
+        table_dir = iceberg_root / container / Path(*elements)
+        schema = paging_rows(0, 1, "eg-test1").schema
+        table = cat.create_table(
+            key,
+            schema=schema,
+            location=fixture_location(table_dir),
+            properties={"write.parquet.row-group-limit": str(PAGING_ROW_GROUP)},
+        )
+        local_dir = local_root / container / Path(*elements)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        start = 0
+        for n, size in enumerate(PAGING_BATCHES):
+            batch = paging_rows(start, size, "eg-test1")
+            table.append(batch)
+            table = cat.load_table(key)
+            pq.write_table(batch, local_dir / f"part-{n}.parquet", row_group_size=PAGING_ROW_GROUP)
+            start += size
+        out[key] = (table.metadata_location, table.current_snapshot().snapshot_id)
+    return PagingTables(
+        tenant_location=out[PAGING_KEY][0],
+        tenant_snapshot=out[PAGING_KEY][1],
+        shared_location=out[PAGING_SHARED_KEY][0],
+        shared_snapshot=out[PAGING_SHARED_KEY][1],
+        local_root=local_root,
+    )
+
+
+def seed_paging_tables(fake, paging: PagingTables, main_ref: str = MAIN_REF) -> None:
+    fake.add_table(
+        "eg-test1", PAGING_KEY, metadata_location=paging.tenant_location,
+        snapshot_id=paging.tenant_snapshot,
+    )
+    fake.add_table(
+        main_ref, PAGING_SHARED_KEY, metadata_location=paging.shared_location,
+        snapshot_id=paging.shared_snapshot,
+    )

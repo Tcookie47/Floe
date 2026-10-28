@@ -255,6 +255,9 @@ option.inactive { color: var(--fg-dim); }
 .results-notice { color: var(--warn); font-weight: 600; }
 .pager { display: inline-flex; align-items: center; gap: 4px; }
 .pager button { padding: 0 6px; }
+.pager[aria-busy="true"] .page-label { opacity: 0.6; }
+.count-btn { white-space: nowrap; }
+.count-btn.busy::before { content: "⏳ "; }
 .results-message { padding: 16px; color: var(--fg-muted); }
 .results-message.loading::before { content: "⏳ "; }
 .results-error {

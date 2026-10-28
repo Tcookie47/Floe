@@ -26,6 +26,8 @@ from fastapi import APIRouter, Request, Response
 
 from floe.core import diagnostics
 from floe.core.profiles import (
+    FIELD_KINDS,
+    INT_BOUNDS,
     SECRET_FIELDS,
     Profile,
     ProfileImportError,
@@ -45,40 +47,6 @@ router = APIRouter(prefix="/api/profiles")
 MAX_NAME = 100
 MAX_TEXT = 4096
 MAX_ENV_BYTES = 256 * 1024
-
-# Validation kind per Profile field (kept in sync with the dataclass by a test).
-FIELD_KINDS: dict[str, Any] = {
-    "name": "name",
-    "mode": ("remote", "local"),
-    "local_fixture_dir": "opt_str",
-    "adls_account": "str",
-    "adls_auth": ("account_key", "service_principal"),
-    "adls_tenant_id": "str",
-    "adls_client_id": "str",
-    "adls_ca_cert_file": "opt_str",
-    "nessie_uri": "str",
-    "nessie_auth": ("oauth2", "none"),
-    "nessie_token_endpoint": "str",
-    "nessie_client_id": "str",
-    "nessie_scope": "str",
-    "nessie_main_ref": "str",
-    "nessie_head_ttl_seconds": "int",
-    "shared_containers": "str_list",
-    "shared_namespaces": "str_list",
-    "tenant_registry_table": "opt_str",
-    "tenant_container_map": "str_map",
-    "tenant_data_source_map": "str_map",
-    "duckdb_memory_limit": "opt_str",
-    "duckdb_threads": "opt_int",
-    "conn_cache_max": "pos_int",
-    "allow_export": "bool",
-    "preview_row_limit": "pos_int",
-    "restrict_file_access": "bool",
-}
-
-
-# Upper bounds for some integer fields (a preview holds its rows in server memory).
-INT_MAXIMA = {"preview_row_limit": 1_000_000}
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -141,7 +109,8 @@ def _check_int(name: str, value: object, minimum: int) -> int:
 
 
 def validate_profile(data: object) -> Profile:
-    """A `Profile` from untrusted JSON: known fields only, each type-checked."""
+    """A `Profile` from untrusted JSON: known fields only, each type-checked against
+    `floe.core.profiles.FIELD_KINDS` / `INT_BOUNDS` (the single source of truth)."""
     if not isinstance(data, dict):
         raise _bad("profile must be an object.")
     secret_keys = set(data) & set(SECRET_FIELDS)
@@ -167,8 +136,10 @@ def validate_profile(data: object) -> Profile:
             clean[key] = _check_int(key, value, 0)
         elif kind == "pos_int":
             clean[key] = _check_int(key, value, 1)
-            if key in INT_MAXIMA and clean[key] > INT_MAXIMA[key]:
-                raise _bad(f"{key} must be at most {INT_MAXIMA[key]:,}.")
+            if key in INT_BOUNDS:
+                low, high = INT_BOUNDS[key]
+                if not low <= clean[key] <= high:
+                    raise _bad(f"{key} must be from {low:,} to {high:,}.")
         elif kind == "opt_int":
             clean[key] = None if value is None else _check_int(key, value, 1)
         elif kind == "bool":

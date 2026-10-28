@@ -98,3 +98,11 @@ def storage_extensions_available():
     from tests.fakes.iceberg_fixtures import extension_unavailable_reason
 
     return extension_unavailable_reason("azure", "httpfs") is None
+
+
+@pytest.fixture(scope="session")
+def paging_tables(iceberg_fixtures, tmp_path_factory):
+    """Multi-file Iceberg + local tables for Preview paging (tests/fakes/iceberg_fixtures.py)."""
+    from tests.fakes.iceberg_fixtures import build_paging_tables
+
+    return build_paging_tables(tmp_path_factory.mktemp("paging"), iceberg_fixtures.iceberg_root)

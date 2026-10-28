@@ -277,10 +277,18 @@ def test_profile_browse_preview_schema_sql(browser, server, iceberg_fixtures, tm
     page.click("#pf-save")  # missing fixture dir → per-field validation error
     expect(page.locator("#pf-local_fixture_dir-error")).to_contain_text("fixture directory")
     page.fill("#pf-local_fixture_dir", str(fx.local_root))
-    page.fill("#pf-preview_row_limit", "0")
-    page.click("#pf-save")
-    expect(page.locator("#pf-preview_row_limit-error")).to_be_visible()
-    page.fill("#pf-preview_row_limit", "1000")
+    # Preview page size: relabelled field (stored as preview_row_limit), 50..5,000, default 500.
+    expect(page.locator("label[for='pf-preview_row_limit']")).to_have_text("Preview page size")
+    expect(page.locator("#pf-preview_row_limit")).to_have_value("500")
+    expect(page.locator("#pf-preview_row_limit")).to_have_attribute("min", "50")
+    expect(page.locator("#pf-preview_row_limit")).to_have_attribute("max", "5000")
+    for bad in ("0", "49", "5001"):
+        page.fill("#pf-preview_row_limit", bad)
+        page.click("#pf-save")
+        expect(page.locator("#pf-preview_row_limit-error")).to_have_text(
+            "Enter a whole number from 50 to 5,000."
+        )
+    page.fill("#pf-preview_row_limit", "500")
     page.fill("#pf-shared_containers", "\n".join(SHARED_CONTAINERS))
     page.fill("#pf-shared_namespaces", "\n".join(SHARED_NAMESPACES))
     page.fill("#pf-tenant_registry_table", REGISTRY_KEY)
@@ -329,11 +337,15 @@ def test_profile_browse_preview_schema_sql(browser, server, iceberg_fixtures, tm
     page.click(".tree-row.table[data-view='bronze_medical']")
     rows = page.locator("#preview-results tbody tr")
     expect(rows).to_have_count(3)
-    expect(page.locator("#preview-results .results-status")).to_contain_text("3 rows")
+    expect(page.locator("#preview-results .results-status")).to_contain_text("Rows 1–3 of 3")
+    expect(page.locator("#preview-results .pager")).to_be_hidden()  # one complete page
     expect(page.locator("#preview-results thead th .cname")).to_have_text(
         ["id", "amount", "code", "data_source"]
     )
-    # Client-side sort on the loaded page.
+    # Client-side sort on the loaded page (the tooltip says so).
+    expect(page.locator("#preview-results thead th[data-col='0']")).to_have_attribute(
+        "title", re.compile("Sorts this page only — use SQL ORDER BY to sort the whole table")
+    )
     page.click("#preview-results thead th[data-col='0']")
     page.click("#preview-results thead th[data-col='0']")
     expect(rows.first.locator("td").nth(1)).to_have_text("3")

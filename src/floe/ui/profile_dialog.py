@@ -178,7 +178,7 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("duckdb_threads", "Threads", "int", DUCKDB, placeholder="(optional)"),
     FieldSpec("conn_cache_max", "Max cached connections", "int", DUCKDB),
     FieldSpec("allow_export", "Allow CSV export", "bool", SAFETY),
-    FieldSpec("preview_row_limit", "Preview row limit", "int", SAFETY),
+    FieldSpec("preview_row_limit", "Preview page size", "int", SAFETY),
     FieldSpec(
         "restrict_file_access",
         "Restrict file access",
@@ -491,7 +491,7 @@ class ProfileDialog(QDialog):
             "duckdb_threads": as_int("duckdb_threads", None),
             "conn_cache_max": as_int("conn_cache_max", 16),
             "allow_export": values["allow_export"],
-            "preview_row_limit": as_int("preview_row_limit", 1000),
+            "preview_row_limit": as_int("preview_row_limit", 500),
             "restrict_file_access": values["restrict_file_access"],
         }
         return Profile(**kwargs)

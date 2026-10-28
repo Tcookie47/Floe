@@ -210,10 +210,15 @@ def test_too_many_unfinished_jobs_is_429(make_client, store, fx):
     assert start_job(client, kind="query", ref="eg-test1", sql="SELECT 1", channel="c9")
 
 
-def test_preview_row_limit_is_capped(local_client, fx):
-    profile = local_profile(fx, preview_row_limit=1_000_001).to_dict()
-    r = local_client.put("/api/profiles/local-p", json={"profile": profile})
-    assert r.status_code == 400 and "preview_row_limit" in r.json()["error"]["message"]
+def test_preview_page_size_bounds(local_client, fx):
+    for bad in (1_000_001, 5001, 49):
+        profile = local_profile(fx, preview_row_limit=bad).to_dict()
+        r = local_client.put("/api/profiles/local-p", json={"profile": profile})
+        assert r.status_code == 400 and "preview_row_limit" in r.json()["error"]["message"]
+    for good in (50, 5000):
+        profile = local_profile(fx, preview_row_limit=good).to_dict()
+        r = local_client.put("/api/profiles/local-p", json={"profile": profile})
+        assert r.status_code == 200
 
 
 def test_read_only_violation(local_client):

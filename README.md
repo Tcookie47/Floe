@@ -97,7 +97,8 @@ or reinstall a newer release wheel with `pipx install --force <url>`.
 - **Table tree.** Grouped by layer (bronze / silver / gold, then anything else),
   with a filter box and status icons; shared reference tables read from the main
   ref appear under **Reference (main)**.
-- **Preview / Schema / SQL.** Preview shows the first `preview_row_limit` rows;
+- **Preview / Schema / SQL.** Preview pages through a table from the server
+  (500 rows per page by default, exact totals or **Count rows**);
   Schema lists columns; SQL runs ad-hoc read-only queries against the tables as
   views, with a row limit, cancel, and lazy table registration.
 - **Tenant filter.** On by default for tenant branches; restricts tenant tables

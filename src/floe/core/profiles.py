@@ -63,6 +63,11 @@ NessieAuth = Literal["oauth2", "none"]
 # Secret fields live only in the keyring, never in profiles.json.
 SECRET_FIELDS = ("adls_account_key", "adls_client_secret", "nessie_client_secret")
 
+# Preview page size (`preview_row_limit`): rows per Preview page.
+PREVIEW_PAGE_DEFAULT = 500
+PREVIEW_PAGE_MIN = 50
+PREVIEW_PAGE_MAX = 5_000
+
 
 @dataclass
 class Profile:
@@ -102,7 +107,10 @@ class Profile:
 
     # Safety
     allow_export: bool = False
-    preview_row_limit: int = 1000
+    # Rows per Preview page ("Preview page size"). The field keeps its historical name
+    # for compatibility with saved profiles and exported profile files; see
+    # `preview_page_size` for the bounds applied at use time.
+    preview_row_limit: int = 500
     # Escape hatch: when False, DuckDB file access is not restricted to the ref's
     # containers (the SQL table-function blocklist still applies).
     restrict_file_access: bool = True
@@ -110,6 +118,20 @@ class Profile:
     def to_dict(self) -> dict[str, Any]:
         """Non-secret fields only, JSON-serializable."""
         return asdict(self)
+
+    @property
+    def preview_page_size(self) -> int:
+        """Rows per Preview page: `preview_row_limit`, clamped at use time.
+
+        Profiles saved by older versions may hold anything up to 1,000,000 (the field used
+        to be a row cap); values above `PREVIEW_PAGE_MAX` are clamped here instead of being
+        rejected. New values are validated to `PREVIEW_PAGE_MIN`..`PREVIEW_PAGE_MAX`.
+        """
+        try:
+            size = int(self.preview_row_limit)
+        except (TypeError, ValueError):
+            return PREVIEW_PAGE_DEFAULT
+        return max(1, min(size, PREVIEW_PAGE_MAX))
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Profile:
@@ -260,10 +282,12 @@ EXPORT_VERSION = 1
 MAX_EXPORT_BYTES = 256 * 1024
 _MAX_NAME = 100
 _MAX_TEXT = 4096
-_MAX_INT = {"preview_row_limit": 1_000_000}
-
-# Validation kind per Profile field (kept in sync with the dataclass by a test).
-IMPORT_FIELD_KINDS: dict[str, Any] = {
+# The one validation table for Profile fields (kept in sync with the dataclass by a test).
+# Used by profile-file import here and by the web API's profile save/test validation
+# (`floe.web.api_profiles` imports it; there is no second copy).
+# Kinds: "name", a tuple of allowed values, "str", "opt_str", "int" (>= 0), "pos_int"
+# (>= 1), "opt_int" (>= 1 or null), "bool", "str_list", "str_map".
+FIELD_KINDS: dict[str, Any] = {
     "name": "name",
     "mode": ("remote", "local"),
     "local_fixture_dir": "opt_str",
@@ -291,6 +315,14 @@ IMPORT_FIELD_KINDS: dict[str, Any] = {
     "preview_row_limit": "pos_int",
     "restrict_file_access": "bool",
 }
+
+# Inclusive (min, max) bounds for some integer fields, on top of their kind's minimum.
+INT_BOUNDS: dict[str, tuple[int, int]] = {
+    "preview_row_limit": (PREVIEW_PAGE_MIN, PREVIEW_PAGE_MAX),
+}
+# Fields whose out-of-bounds values in an imported profile file are clamped (with a
+# note) rather than rejected: files exported by older versions may hold old values.
+CLAMP_ON_IMPORT = frozenset({"preview_row_limit"})
 
 SECRETS_NOT_IMPORTED_NOTE = (
     "The file contained secret fields, which were ignored: secrets are never imported "
@@ -386,8 +418,10 @@ def _check_field(key: str, kind: Any, value: object, errors: list[str]) -> Any:
         if n is None:
             suffix = " or null." if kind == "opt_int" else "."
             bad(f"must be a whole number >= {minimum}{suffix}")
-        elif key in _MAX_INT and n > _MAX_INT[key]:
-            bad(f"must be at most {_MAX_INT[key]:,}.")
+        elif key in INT_BOUNDS and key not in CLAMP_ON_IMPORT:
+            low, high = INT_BOUNDS[key]
+            if not low <= n <= high:
+                bad(f"must be from {low:,} to {high:,}.")
         return n
     if kind == "bool":
         if not isinstance(value, bool):
@@ -447,16 +481,23 @@ def parse_profile_export(text: str) -> ProfileImport:
     secret_keys = (set(body) | set(data)) & set(SECRET_FIELDS)
     if secret_keys:
         result.notes.append(SECRETS_NOT_IMPORTED_NOTE)
-    unknown = sorted(str(k) for k in body if k not in IMPORT_FIELD_KINDS and k not in SECRET_FIELDS)
+    unknown = sorted(str(k) for k in body if k not in FIELD_KINDS and k not in SECRET_FIELDS)
     if unknown:
         result.notes.append(f"Ignored unknown field(s): {', '.join(unknown)}.")
 
     errors: list[str] = []
     if "name" not in body:
         errors.append("name: is required.")
-    for key, kind in IMPORT_FIELD_KINDS.items():
+    for key, kind in FIELD_KINDS.items():
         if key in body:
             result.fields[key] = _check_field(key, kind, body[key], errors)
+    for key in sorted(CLAMP_ON_IMPORT & set(result.fields)):
+        value = result.fields[key]
+        low, high = INT_BOUNDS[key]
+        if isinstance(value, int) and not low <= value <= high:
+            clamped = max(low, min(value, high))
+            result.fields[key] = clamped
+            result.notes.append(f"{key}: {value:,} is outside {low:,}–{high:,}; using {clamped:,}.")
     if errors:
         raise ProfileImportError(errors)
     profile = Profile.from_dict(result.fields)

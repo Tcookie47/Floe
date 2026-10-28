@@ -350,8 +350,10 @@ removes it on Save.
 - **`allow_export`** (Safety group) — gates the **Export CSV…** action; off
   by default. With it off, export does nothing (a message explains it's
   disabled for the profile).
-- **`preview_row_limit`** (Safety group, default `1000`) — rows shown in the
-  Preview tab.
+- **Preview page size** (`preview_row_limit`, Safety group, default `500`,
+  50–5,000) — rows per Preview page. Preview loads one page at a time from
+  the server. (The field kept its old name so saved and exported profiles
+  still work; a larger value saved by an older version is used as 5,000.)
 - **DuckDB tuning** (DuckDB group): `duckdb_memory_limit` (e.g. `4GB`,
   unset by default), `duckdb_threads` (unset by default), and
   `conn_cache_max` (default `16`) — the maximum number of DuckDB connections
@@ -416,8 +418,27 @@ Each step shows a pass/fail line with its message and elapsed time.
   filter. Not applicable on the main branch (control is disabled there). Can
   be turned off per query, and a table with no `data_source` column offers
   to disable the filter for that query.
-- **Preview** tab — shows the first `preview_row_limit` rows of the selected
-  table.
+- **Preview** tab — browses the selected table **page by page**; each page
+  (the profile's **Preview page size**, default 500 rows) is read from the
+  server when you ask for it, so large tables open quickly.
+  - **Next / Prev / First / Last** load that page from the server. Picking
+    another table or branch cancels a page that is still loading (so does
+    **Esc**).
+  - **Totals.** "Rows 501–1,000 of 2,400" when the total is known: from the
+    table's current snapshot (main branch, shared reference tables, or the
+    tenant filter turned off), or once the last page was reached. With the
+    tenant filter on, Floe can't know the total without counting, so it shows
+    "of 1,000+", **Last** is disabled, and a **Count rows** button runs
+    `count(*)` in the background (click it again to cancel). Once counted, the
+    exact total shows and **Last** works for that table until the branch moves.
+    Page 1 never waits for a count.
+  - If the branch moves while you browse, Floe says "This branch changed since
+    you started browsing — back to page 1" and reloads page 1, so pages never
+    mix two versions of the data.
+  - Clicking a column header **sorts the current page only** (the tooltip says
+    so); use `ORDER BY` in the SQL tab to sort the whole table.
+  - **Export CSV…** and **Save as image…** in Preview cover the current page
+    only; the confirmation says which rows ("this page (rows 501–1,000)").
 - **Schema** tab — lists column name, type, and nullability.
 - **SQL** tab — a CodeMirror editor plus a results grid.
   - **Ctrl/Cmd+Enter** runs the current selection, or the whole editor if
@@ -448,7 +469,8 @@ Each step shows a pass/fail line with its message and elapsed time.
   your browser (Floe keeps no copy) before writing.
 #### Share a query result as an image
 
-1. Run a query on the **SQL** tab.
+1. Run a query on the **SQL** tab (or, in **Preview**, go to the page you want:
+   the image then covers up to 50 rows of that page).
 2. Click **Save as image…** next to Export CSV… (or press Ctrl/Cmd+Shift+S).
    It is enabled only when there is a finished result and the active profile
    has **Allow export** turned on (Profiles… → Safety → Allow export).
@@ -484,7 +506,7 @@ it, so only share it where that is allowed.
   | Esc | Cancel the running query |
   | Ctrl/Cmd+R | Refresh the catalog |
   | Ctrl/Cmd+F | Filter tables (outside the editor) |
-  | Ctrl/Cmd+Shift+S | Save the SQL result as an image |
+  | Ctrl/Cmd+Shift+S | Save the SQL result (or the Preview page) as an image |
   | Alt+1 / 2 / 3 | Preview / Schema / SQL tab |
   | Ctrl/Cmd+C | Copy selected cells as TSV (in a grid) |
   | Ctrl/Cmd+A | Select all cells (in a grid) |

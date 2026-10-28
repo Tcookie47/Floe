@@ -8,13 +8,13 @@ desktop app.
 Floe runs entirely on your own machine and is read-only: it never writes to
 Iceberg or Nessie.
 
-Current release: **v1.3.0**. Check the
+Current release: **v1.4.0**. Check the
 [Releases page](https://github.com/Tcookie47/Floe/releases) for a newer
-version and substitute it in the wheel URL below (both the `v1.3.0` folder and
-the `1.3.0` in the file name):
+version and substitute it in the wheel URL below (both the `v1.4.0` folder and
+the `1.4.0` in the file name):
 
 ```
-https://github.com/Tcookie47/Floe/releases/download/v1.3.0/floe-1.3.0-py3-none-any.whl
+https://github.com/Tcookie47/Floe/releases/download/v1.4.0/floe-1.4.0-py3-none-any.whl
 ```
 
 ---
@@ -139,13 +139,13 @@ Floe in its own isolated environment.
 3. **Open a new terminal window** (so the PATH change applies).
 4. Install Floe:
    ```
-   pipx install --python python3.12 "https://github.com/Tcookie47/Floe/releases/download/v1.3.0/floe-1.3.0-py3-none-any.whl"
+   pipx install --python python3.12 "https://github.com/Tcookie47/Floe/releases/download/v1.4.0/floe-1.4.0-py3-none-any.whl"
    ```
 5. Verify:
    ```
    floe --version
    ```
-   Expect `floe 1.3.0 (<commit>)`.
+   Expect `floe 1.4.0 (<commit>)`.
 
 ### Windows (PowerShell)
 
@@ -163,13 +163,13 @@ Floe in its own isolated environment.
 3. **Close and reopen PowerShell.**
 4. Install Floe:
    ```
-   pipx install --python 3.12 "https://github.com/Tcookie47/Floe/releases/download/v1.3.0/floe-1.3.0-py3-none-any.whl"
+   pipx install --python 3.12 "https://github.com/Tcookie47/Floe/releases/download/v1.4.0/floe-1.4.0-py3-none-any.whl"
    ```
 5. Verify:
    ```
    floe --version
    ```
-   Expect `floe 1.3.0 (<commit>)`.
+   Expect `floe 1.4.0 (<commit>)`.
 
 ### Linux
 
@@ -191,13 +191,13 @@ Floe in its own isolated environment.
    ```
 3. Install Floe:
    ```
-   pipx install --python python3.12 "https://github.com/Tcookie47/Floe/releases/download/v1.3.0/floe-1.3.0-py3-none-any.whl"
+   pipx install --python python3.12 "https://github.com/Tcookie47/Floe/releases/download/v1.4.0/floe-1.4.0-py3-none-any.whl"
    ```
 4. Verify:
    ```
    floe --version
    ```
-   Expect `floe 1.3.0 (<commit>)`.
+   Expect `floe 1.4.0 (<commit>)`.
 
 ---
 

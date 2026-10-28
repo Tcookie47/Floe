@@ -66,6 +66,8 @@ class SnapshotInfo:
     added_files: int | None
     removed_files: int | None
     total_records: int | None
+    # total-position-deletes + total-equality-deletes (None when the summary has neither)
+    total_deletes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,27 @@ def decode_metadata(raw: bytes) -> dict[str, Any]:
     return data
 
 
+def _total_deletes(summary: dict[str, Any]) -> int | None:
+    values = [_int(summary.get(k)) for k in ("total-position-deletes", "total-equality-deletes")]
+    present = [v for v in values if v is not None]
+    return sum(present) if present else None
+
+
+def current_row_total(history: TableHistory) -> int | None:
+    """Exact row count of the current snapshot from its summary, or None if unknown.
+
+    Uses `total-records`; None when the summary lacks it or when the snapshot carries
+    row-level deletes (merge-on-read delete files), since `total-records` then still
+    counts the deleted rows.
+    """
+    snap = history.current
+    if snap is None or snap.total_records is None:
+        return None
+    if snap.total_deletes:
+        return None
+    return snap.total_records
+
+
 def parse_table_history(metadata: dict[str, Any]) -> TableHistory:
     """`snapshots[]` + `current-snapshot-id` of an Iceberg table-metadata document."""
     snapshots: list[SnapshotInfo] = []
@@ -169,6 +192,7 @@ def parse_table_history(metadata: dict[str, Any]) -> TableHistory:
                 added_files=_int(summary.get("added-data-files")),
                 removed_files=_int(summary.get("deleted-data-files")),
                 total_records=_int(summary.get("total-records")),
+                total_deletes=_total_deletes(summary),
             )
         )
     snapshots.sort(key=lambda s: (s.time or datetime.min.replace(tzinfo=UTC), s.snapshot_id))
@@ -217,6 +241,21 @@ class _MetadataCache:
 METADATA_CACHE = _MetadataCache()
 
 
+def load_history(location: str, read: Callable[[], bytes], dotted: str) -> TableHistory:
+    """Parsed history of the metadata.json at `location` (cached; `read()` on a miss)."""
+    cached = METADATA_CACHE.get(location)
+    if cached is not None:
+        return cached
+    raw = read()
+    try:
+        history = parse_table_history(decode_metadata(raw))
+    except (ValueError, UnicodeDecodeError, OSError, EOFError) as exc:
+        reason = f"invalid JSON ({type(exc).__name__})"
+        raise MetadataReadError(dotted, reason) from None
+    METADATA_CACHE.put(location, history)
+    return history
+
+
 def table_snapshots(
     session: FloeSession,
     ref: str,
@@ -228,17 +267,7 @@ def table_snapshots(
     table_key = TableKey.parse(key) if isinstance(key, str) else key
 
     def load(location: str, read: Callable[[], bytes]) -> TableHistory:
-        cached = METADATA_CACHE.get(location)
-        if cached is not None:
-            return cached
-        raw = read()
-        try:
-            history = parse_table_history(decode_metadata(raw))
-        except (ValueError, UnicodeDecodeError, OSError, EOFError) as exc:
-            reason = f"invalid JSON ({type(exc).__name__})"
-            raise MetadataReadError(table_key.dotted, reason) from None
-        METADATA_CACHE.put(location, history)
-        return history
+        return load_history(location, read, table_key.dotted)
 
     info, history = session.with_table_metadata(ref, table_key, load, cancel_token=cancel_token)
     return TableSnapshots(info=info, history=history)
